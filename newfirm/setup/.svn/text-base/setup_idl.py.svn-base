@@ -1,0 +1,249 @@
+#!/usr/bin/env python
+# $Id: setup.py 9 2008-04-06 12:52:58Z nmbs $
+import os
+import sys
+import shutil
+import string
+from math import *
+from numarray import *
+import string
+
+debug=0
+verbose = 1
+o = os.system
+dbadpix = 'calib/badpix/'
+ddark = 'calib/dark/'
+dflat = 'calib/flat/'
+draw = 'raw'
+dref = 'calib/refimage/'
+log = '00NIGHT_LOG.cat'
+fields = 'setup/00FIELDS.cat'
+
+radeg=180/pi
+distance_lim=0.2 # [degrees] if pointing within some angle, assume we are on the right field
+
+if not os.access(fields,os.F_OK):
+   print('NOTE: no fields file found, please provide a file ',fields,' containing 3 columns: fieldname, ra, dec')
+   sys.exit()
+
+# ------------------------------------------------------------ begin class cat 
+class cat:
+  """Simple catalog class.""" 
+
+  def __init__(self,catfile=None):
+    if catfile is None:
+      self.data = []
+      self.hdr = []
+      self.datatype=[]
+    else: 
+      self.load(catfile)  
+
+  # load catalog, give filename
+  def load(self,catfile):
+    f = open(catfile)
+    lines = f.readlines()
+    f.close()
+    self.hdr = string.split(lines[0].lower().replace('#',''))
+    self.data = []
+    for line in lines[1:]: 
+      self.data.append(string.split(line))
+
+  # select columns given list of header keywords
+  def col(self,keylis):
+    """Select columns keylis from catalog"""
+    
+    keylis = keylis.lower().split()
+
+    ikeys=[]
+    for key in keylis:
+      ikeys.append(self.hdr.index(key))
+    cols=[]
+
+    # in each row, select one or more columns
+    for row in self.data:
+      c=[]
+      if debug: print row
+      for i in ikeys:
+        if i > len(row): 
+          print "WARNING: too few elements in row "+row
+          continue
+        try: # if cannot eval to float or int, use string
+           c.append(eval(row[i]))
+        except (SyntaxError,TypeError,NameError):
+           c.append(row[i]) 
+
+      # if only one key, write plain list i.s.o. nested  
+      if len(ikeys) == 1: 
+        cols.append(c[0])
+      else:
+        cols.append(c)
+
+    return cols
+# --------------------------------------- end class cat 
+ 
+# ------------------------------------------------------------ declare functions 
+def write_prepscript(dnight,outfile,refimage,filt,ncoadd,expcoadd):
+    dark = ddark+'dark_'+str(ncoadd)+'x'+str(expcoadd)+'s'
+    flat = dflat+'flat_'+filt
+    print "using ", dark, flat
+    # write the prep file
+    f=open(outfile+'.prep','w')
+    for i in range(1,5):
+      f.write("cat "+outfile+"/raw.lis | awk '{print a b $1}' b=q"+str(i)+"_ a="+outfile+"/ > "+outfile+"/raw_q"+str(i)+".lis \n")
+    f.close() 
+    os.system('source '+outfile+'.prep ; rm '+outfile+'.prep')
+    f=open(outfile+'.setup.idl','w')
+    f.write('readcol, "'+outfile+'/raw.lis", fname, f="a" \n\n')
+    for i in range(1,5):
+      f.write('for i=0,n_elements(fname)-1 do if not file_test("'+outfile+'/q'+str(i)+'_"+fname[i]+".fits") then writefits, "'+outfile+'/q'+str(i)+'_"+fname[i]+".fits", (readfits("raw/"+fname[i]+".fits",hdr,exten='+str(i)+',/silent)-readfits("'+dark+'.fits",exten='+str(i)+',/silent))/readfits("'+flat+'.fits",exten='+str(i)+',/silent), hdr \n\n')
+    f.write('exit')
+    f.close() 
+    f=open(outfile+'.reduce.idl','w')
+    for i in range(1,5):
+      f.write('nmbs, "'+outfile+'/raw_q'+str(i)+'.lis", output="'+outfile+'/'+outfile+'_q'+str(i)+'_", bpmask="./calib/badpix/bp_q'+str(i)+'.fits.gz", nskymean=8, nskymin=4, /verbose \n\n') 
+    f.write('exit')
+    f.close() 
+    # separate scripts for the per q3
+    # @@ to keep consistent with old setup write filenames without quadrant. @@ but should just add quadrant name to image
+    # @@ also need to make reduced subdir in dnight that links to the reduced files after moving. but need to change dir layout first (to aligned/night for example)
+    f=open(outfile+'.setup_reduce_q3.idl','w')
+    f.write('readcol, "'+outfile+'/raw.lis", fname, f="a" \n\n')
+    f.write('for i=0,n_elements(fname)-1 do if not file_test("'+outfile+'/q3_"+fname[i]+".fits") then writefits, "'+outfile+'/q3_"+fname[i]+".fits", (readfits("raw/"+fname[i]+".fits",hdr,exten=3,/silent)-readfits("'+dark+'.fits",exten=3,/silent))/readfits("'+flat+'.fits",exten=3,/silent), hdr \n\n')
+    f.write('nmbs, "'+outfile+'/raw_q3.lis", output="'+outfile+'/'+outfile+'_", bpmask="./calib/badpix/bp_q3.fits.gz", refimage="'+refimage+'_q3.fits", nskymean=8, nskymin=4, /calcdepth, /verbose \n\n') 
+    f.write("$rm -rf "+outfile+"/*sub.fits \n")
+    f.write("$mv "+outfile+"/*_?p* ../aligned/q3/"+dnight+" \n")
+    f.write("$mv "+outfile+"/*_obm.fits ../aligned/q3/"+dnight+" \n")
+    f.write("$mv "+outfile+"/*shift.lis ../aligned/q3/"+dnight+"\n\n")
+    f.close() 
+
+# from skyangles to degrees
+def todeg(angle):
+  a = angle.split(':')
+  return int(a[0])+int(a[1])/60.+float(a[2])/3600. 
+
+# find first field within distance_lim of ra,dec
+def resolvefield(ra,dec,fl):
+  a1 = todeg(ra)*15.
+  d1 = todeg(dec)
+  # loop fields
+  for name,ra2,dec2 in zip(fl.col('name'),fl.col('ra'),fl.col('dec')):
+    a2 = todeg(ra2)*15.
+    d2 = todeg(dec2)
+    dist = sqrt((d1-d2)**2 + ((a1-a2)*cos(d1*pi/180))**2)
+    if dist < distance_lim:
+      print 'resolved field ',a1,d1, ' = ', name, ' (distance ',dist, 'deg)' 
+      return name  
+  # we found no matching field
+  return 'UNKNOWN'
+
+# ---------------------------------------------------------- script starts here
+if len(sys.argv) < 2:
+  print 'usage: $ setup.py [path_to_raw_data/night]'
+  print 'e.g.: $ setup.py /Volumes/NEWFIRM1/20080325'
+  sys.exit()
+
+if not os.access('calib',os.F_OK):
+  os.mkdir('calib')
+  os.mkdir('calib/dark/')
+  os.mkdir('calib/flat/')
+  os.mkdir('calib/badpix/')
+  print 'note: calibration files in the following directories are required: '
+  print './calib ./calib/dark ./calib/flat ./calib/badpix'
+  
+dsrc = sys.argv[1]
+# assume night dir the deepest subdir in the provided path
+for dir in dsrc.split('/'):
+  if len(dir) > 0: dnight = dir
+
+if not os.access('aligned/q1/'+dnight,os.F_OK): os.makedirs('aligned/q1/'+dnight)
+if not os.access('aligned/q2/'+dnight,os.F_OK): os.makedirs('aligned/q2/'+dnight)
+if not os.access('aligned/q3/'+dnight,os.F_OK): os.makedirs('aligned/q3/'+dnight)
+if not os.access('aligned/q4/'+dnight,os.F_OK): os.makedirs('aligned/q4/'+dnight)
+ 
+if not os.access(dnight,os.F_OK):
+  os.mkdir(dnight)
+
+# change to the night dir
+os.chdir(dnight)
+
+# in the night directory: link the raw and calib directory
+if os.access(dsrc,os.F_OK):
+   if os.access(draw,os.F_OK):
+     os.system('rm raw')
+   os.system('ln -s '+dsrc+' '+draw)
+   if verbose: print('linking '+dsrc+' to '+draw)
+
+if not os.access('calib',os.F_OK):
+   os.system('ln -s ../calib')
+
+# get summary of vital keywords 
+# note: wcstools need to be installed
+if verbose: print('getting header keywords of all fits files: this may take a minute...')
+
+hkey="FILENAME OBSTYPE TELRA TELDEC OBJECT EXPCOADD NCOADD EXPTIME  NOCNO NOCTOT TIME-OBS FILTER"
+if not os.access(log,os.F_OK):
+  o('echo "# '+hkey+' " | sed s/-//g > '+log)
+  o('gethead -bf '+hkey+' raw/raw*fits* | sed s/\.fits// >> '+log) 
+
+# night log
+nl = cat(log)
+nl_frame = nl.col('filename') 
+nl_obj = nl.col('object') 
+nl_ditnr = nl.col('nocno') 
+nl_filt = nl.col('filter') 
+nl_ncoadd = nl.col('ncoadd') 
+nl_expcoadd = nl.col('expcoadd') 
+
+# this is wrong: use crval1,2
+nl_ra = nl.col('telra') 
+nl_dec = nl.col('teldec') 
+
+#field centers
+fl = cat('../'+fields)
+
+print 'extracting skysub sequences'
+dit0=999
+for frame,obj,dit,vfilt,ra,dec,ncoadd,expcoadd in zip(nl_frame,nl_obj,nl_ditnr,nl_filt,nl_ra,nl_dec,nl_ncoadd,nl_expcoadd):
+  #for fname,obj,dit in nl.col(['filename','object','nocno']):
+  if obj == 'DitherStare_Field':
+    # if dither follow number drops: signals a new sequence
+    if dit < dit0:      
+      # this is not the first sequence, so close the previous sequence first     
+      if dit0 < 999: 
+        f.close()       
+        write_prepscript(dnight,outfile,refimage,vfilt0,ncoadd0,expcoadd0) # write xdimsum setup script
+      
+      # start new sequence
+      print '\nfound new dither sequence: filter='+vfilt
+      field =  resolvefield(ra,dec,fl)
+      outfile = field+'_'+vfilt
+      refimage = dref+field+'_ref'
+
+      # make unique filenames a la iraf if already exists
+      while os.access(outfile,os.F_OK):
+         tmpout = outfile.split('.')
+         if len(tmpout) == 1:  # this is the second FIELD_FILTER -> so make FIELD_FILTER.1
+           outfile=outfile+'.1'
+         else: outfile=tmpout[0]+'.'+str(int(tmpout[1])+1) # make FIELD_FILTER.[N] -> FIELD_FILTER.[N+1]
+      else: os.mkdir(outfile)
+
+      if not os.access(outfile,os.F_OK):
+        os.mkdir(outfile)      
+      f=open(outfile+'/raw.lis','w')
+
+    # write frame to current sequence
+    f.write(frame+'\n')
+    # properties of current sequence
+    dit0=dit
+    vfilt0=vfilt
+    ncoadd0=ncoadd
+    expcoadd0=expcoadd
+
+# close final dither file
+f.close() # closing previous file        
+write_prepscript(dnight,outfile,refimage,vfilt0,ncoadd0,expcoadd0) # write xdimsum setup script
+
+# cat scripts together to reduce q3 of entire night
+os.system('cat *setup_reduce_q3.idl > 00setup_reduce_q3.idl ; echo "exit" >> 00setup_reduce_q3.idl')
+
+sys.exit()

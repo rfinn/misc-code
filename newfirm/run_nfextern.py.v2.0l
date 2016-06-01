@@ -1,0 +1,1517 @@
+#! /usr/bin/env python
+#
+# RUN_NFEXTERN.PY
+# V2.0L -- Created on 02/24/10. DO_BIAS2 turns on bias removal in both direction
+#          Added DO_BIAS2 keyword to images. O/1 depending on whether do_bias2 is set!
+#          Change on 02/28/10 @10:35PM to round the CRPIX1/CRPIX2 for the blank.fits image used for reference stacking
+#          Change bin size in run_combine() to handle more than 200 stacks in the case of Janice's 2008 data.
+#          Some tweak on 03/09/10 to handle some weight/zpt/psf for ss1
+# V2.0K -- Created on 02/09/10
+#          Modifications to handle certain use of CRs based on the BPM settings
+#          The BPM for first pass is set to the default static BPM
+#          Created routine called make_obm2T_files(to combine obmT with rej.fits) but remove static BPM.
+#          fixed gethead() to handle strings
+#          Made a few modifications to make sure all the ZPT stuff is properly transfer over
+#          Added a DO_SINC option in keyword_flag.txt
+#          iraf.unlearn(incombine) added on 02/17/10 @ 11:58AM
+#          5sigma clipping in FP for CR rejmsk to handle bad pixels and 10pix boundary in mscimage of reprojections #02/22/10 @2:36P
+# V2.0J -- Created on 01/28/10
+#          run fixpix using the CR masks
+#          Inclusion of CR rejection in run_combine(). Also created make_crmask(). 01/31/10 - 02/03/10
+#          Fixed a few errors in median_filter() due to a bug with mask_im.
+#          Cannot NaN a byte array. Defined mask_im2 which is a float array. 02/01/10
+#          Also changed using obm2T files to gzip format for median_filter(). Moved gzipped obm2T files earlier. 02/02/10
+#          Also changed 
+#          changed hsigma from 2.0 to 3.0. Don't need to go that faint for low surface brightness
+#          Modified run_combine to have just the loop and cycles to be 1 for lists < nlimit. 02/02/10
+#          Also created weights_zpt() for second pass to define weights, and scaling
+# V2.0I -- Consolidation of certain sub-steps.
+#          Created flatten_images()
+#          Combined det_norm() and exp_norm(). Each images are individually checked.
+#          Created run_skysub()
+#          nosubJ not fully implemented yet
+#          Fix sign error in zpt_scale array
+#          Fixed bug: mdpt is string. float() it.
+# V2.0H -- Reproduce rej.fits files through make_rej_mask()
+#          Output datfile in median_filter() to bias directory
+#          mscimage commands are printed on screen
+#          fixed a few %@s -> @%s
+# V2.0G -- defined run_combine() and using it for DO_COMB1 and DO_COMB2
+# V2.0F -- modified IMCOMBINE to split things up in first pass
+#
+# V2.0E -- modifications to WCS saving, etc.
+#
+# V2.0D -- Changed some of the IRAF commands to be shorter along horizontal direction
+#          Unique err.log files. std_file, std_log new definitions
+#          Also corrected it to have D0_LINFLAT2 and DO_LINFLAT -> DO_LINFLAT1
+#
+# This script was created on 08/18/09 and is intended to run the NFEXTERN package to reduce NEWFIRM data.
+# v2.0 - modified on 11/03 to recompute weights based on ACE outputs
+#
+#To execute file, type in the UNIX command line:
+# "/scisoft/bin/python run_nfextern.py keyword_flag.txt all_list field_stack default_badpix log run"
+# argv[1] = 'keyword_flag.txt' -- Input parameter file controlling sequence of reduction with flags.
+#                                 The second column is case sensitive and the third column is '0' or '1'
+# argv[2] = 'list.raw.all' -- ASCII input list containing the frames to be modified
+# argv[3] = 'field_stack.txt' -- Input parameter file controlling the stacking based on field and filter
+# argv[4] = default BPM -- MEF format with trimfix+
+# argv[5] = do_log. Controlling logging of commands in 'nfextern_cmds.log'
+# argv[6] = do_run. Runs all PyRAF/IRAF reduction commands
+# argv[7] = do_delete. Deletes files after they have been produced and in some cases, they are gzipped.
+
+import sys, os
+from os.path import exists #for file_searching
+import commands #for UNIX command implementation
+from pyraf import iraf
+import pyfits, numpy, numarray
+from Numeric import *
+from pylab import *
+import asciidata, math #for reading in ASCII files
+import array, time, sets
+
+def print_log(text, scr=1):
+    if scr == 1: print text
+    if do_log == 1: f.write(text + '\n')
+#end print_log module
+
+def unix_exec(text, scr=1):
+    commands.getstatusoutput(text); print_log(text, scr=scr)
+#end unix_exec module
+
+def pycmd(text, scr=1):
+    print_log(text, scr=scr); exec(text)
+    if exists(std_file):
+        commands.getstatusoutput('cat '+std_file+' >> '+msg_log) # append to message log
+        commands.getstatusoutput('rm -f '+std_file)
+    #endif
+#end pycmd module
+
+def gettime():
+    return ' ... '+time.strftime("%d %b %Y %H:%M:%S", time.localtime())
+#end of gettime module
+
+def check_for_file(pref, suff): #, nfiles):
+    #suff -- should include '.' and can include any wildcards
+    #pref -- does not need to include any '*'
+    test1 = commands.getstatusoutput('ls -1 '+pref+'*'+suff)
+    if test1[0] == 0:
+        print "#File of the form: "+pref+"*"+suff+" EXISTS!"
+        #if len(test1[1].split('\n')) != nfiles: print "Not all the same files are found"
+        return 'False'
+    else: return 'True'
+#end of check_for_file module
+
+def run_gethead(keyword, prefix, suffix): #looks for prefix/suffix files
+    #print 'gethead -f '+keyword+' '+prefix+'/'+suffix+' > ghead.dat'
+    ghead0 = commands.getstatusoutput('gethead '+keyword+' '+prefix+'/'+suffix+' > '+prefix+'_ghead.dat')
+    if ghead0[1] == '':
+        values = (asciidata.open(prefix+'_ghead.dat'))[0]
+    else: values = -1
+    values0 = numpy.zeros(len(values))
+    for i in range(len(values)): values0[i] = values[i]
+    return values0
+#end of run_gethead module
+
+def bpm_notes(txt):
+    if do_bpmlog: bpml.write(txt)
+    print_log('# BPM STUFF: '+txt)
+#end of bpm_notes module
+
+def create_bpmlog():
+    bpm_logfile = prefix+'/bpm.log.'+time0
+    if exists(bpm_logfile): bpml = file(bpm_logfile, 'a', 0)
+    else: bpml = file(bpm_logfile, 'w', 0)
+    bpml.write('\n###'+time0+'\n')
+    return bpml
+#end of create_bpmlog module
+
+def clip_median(val):
+    niter = 3; mark = val
+    for kk in range(niter):
+        sigma0 = numpy.std(mark); avg0 = numpy.median(mark)
+        good = numpy.where( numpy.abs(mark - avg0) < 2.0*sigma0)
+        #good = numpy.where( mark - avg0 < 2.0*sigma0) #01/28/10. Took out the abs. Only consider things below 2sigma
+        mark = mark[good]
+    #endfor
+    return mark
+#end of clip_median module
+
+def median_filter(file_list, mask_list): #twice as fast compared to IRAF/fit1d
+    print_log("#Removing median among rows/columns"+gettime())
+    if do_bias2: print_log("#Will do bias removal in both directions"+gettime())
+    # array convention is that first element is rows, second is column for 2-D
+    # For bias removal with IRAF/fit1d
+    iraf.fit1d.low_reject=2.5; iraf.fit1d.high_reject=2.5; iraf.fit1d.function="legendre"; iraf.fit1d.inter=NO
+    iraf.fit1d.type='difference'; iraf.fit1d.order=1; iraf.fit1d.naverage=1; iraf.fit1d.sample="*"
+    iraf.fit1d.grow=1.; iraf.fit1d.niterate=3
+
+    bias_dir = prefix+'/bias2'
+    if not exists(bias_dir): unix_exec('mkdir '+bias_dir)
+
+    do_fit1d = 0 #set to zero to use my implementation of bias removal instead of J.Lee's IRAF.fit1d
+    matrix = ['CD1_1', 'CD1_2', 'CD2_1', 'CD2_2']
+    if not do_fit1d:
+        print_log("#Using python + obj masking approach")
+        for j in range(len(file_list)):
+            if len(iraf.hedit(file_list[j]+'[1]','DO_BIAS','.', Stderr=1)) == 0: # check to see if it has been modified
+                print "# Bias removal for "+file_list[j]+gettime()
+                hdulist = pyfits.open(file_list[j], mode='update')
+                if j == 0: print mask_list[j]+'.gz'
+                masklist = pyfits.open(mask_list[j]+'.gz') #reading in the gzipped file
+                for k in dets:
+                    axis0 = axis[k-1]; im=hdulist[k].data
+                    if not do_bias2:
+                        datfile = file_list[j].replace('.fits', '_'+str(k)+'.dat').replace('sss1LT', 'bias2/sss1LT')
+                        datfile1 = datfile; datfile2 = datfile
+                    else: 
+                        datfile1 = file_list[j].replace('.fits', '_'+str(k)+'.1.dat').replace('sss1LT', 'bias2/sss1LT')
+                        datfile2 = file_list[j].replace('.fits', '_'+str(k)+'.2.dat').replace('sss1LT', 'bias2/sss1LT')
+                    #endelse
+
+                    hdulist[k].header.update('DO_BIAS', 1, 'Added'+gettime())
+                    hdulist[k].header.update('DO_BIAS2', do_bias2, 'Added'+gettime()) #set to 0 or 1 depending on whether we run it or not.
+                    #The following avoids 'Card image is not FITS standard (unparsable value string)'. Deletes comment info
+
+                    for key in matrix: hdulist[k].header.update(key, hdulist[k].header[key], '')
+                    if not exists(datfile1):
+                        f5 = file(datfile1, 'w', 0)
+                        if do_bias2: f6 = file(datfile2, 'w', 0) #remove bias in the opposite direction
+                        mask_im = masklist[k].data; mask_im2 = numarray.zeros([2046,2046],Float)
+                        #print len(mask_im)
+                        good = numarray.nonzero(mask_im)
+                        if len(good[0]) > 0: mask_im2[good] = numpy.nan #replace mask region with NaN's
+                        else: print "no mask values"
+                        if axis0 == 1: # median over rows
+                            for ll in range(2046):
+                                oned = im[ll,:]; good = oned[numpy.isfinite(mask_im2[ll,:])]
+                                good = clip_median(good);
+                                if len(good) > 0:
+                                    med0 = numpy.median(good)
+                                    #print ll, len(good)
+                                else: med0 = 0
+                                im[ll,:] = im[ll,:] - med0
+                                f5.write(str(ll)+' '+str(med0)+' '+str(len(good))+'\n')
+                            #endfor 
+                            if do_bias2:
+                                for ll in range(2046):
+                                    oned = im[:,ll]; good = oned[numpy.isfinite(mask_im2[:,ll])]
+                                    good = clip_median(good);
+                                    if len(good) > 0: med0 = numpy.median(good)
+                                    else: med0 = 0
+                                    im[:,ll] = im[:,ll] - med0
+                                    f6.write(str(ll)+' '+str(med0)+' '+str(len(good))+'\n')
+                                #endfor
+                            #endif
+                        else: # median over columns
+                            for ll in range(2046):
+                                oned = im[:,ll]; good = oned[numpy.isfinite(mask_im2[:,ll])]
+                                good = clip_median(good);
+                                if len(good) > 0: med0 = numpy.median(good)
+                                else: med0 = 0
+                                im[:,ll] = im[:,ll] - med0
+                                f5.write(str(ll)+' '+str(med0)+' '+str(len(good))+'\n')
+                            #endfor
+                            if do_bias2:
+                                for ll in range(2046):
+                                    oned = im[ll,:]; good = oned[numpy.isfinite(mask_im2[ll,:])]
+                                    good = clip_median(good);
+                                    if len(good) > 0: med0 = numpy.median(good)
+                                    else: med0 = 0
+                                    im[ll,:] = im[ll,:] - med0
+                                    f6.write(str(ll)+' '+str(med0)+' '+str(len(good))+'\n')
+                                #endfor
+                            #endif
+                        #endelse
+                        f5.close()
+                        if do_bias2: f6.close()
+                    else:
+                        data1 = asciidata.open(datfile1); gdata1 = data1[1]
+                        if do_bias2: data2 = asciidata.open(datfile2); gdata2 = data2[1]
+                        if axis0 == 1: # median over rows
+                            for ll in range(2046):
+                                im[ll,:] = im[ll,:] - gdata1[ll]
+                                if do_bias2: im[:,ll] = im[:,ll] - gdata2[ll]
+                            #endfor
+                        else: # median over columns
+                            for ll in range(2046):
+                                im[:,ll] = im[:,ll] - gdata1[ll]
+                                if do_bias2: im[ll,:] = im[ll,:] - gdata2[ll]
+                            #endfor
+                        #endelse
+                    #endelse
+                    hdulist[k].data = im
+                #endfor
+                hdulist.flush() #hdulist.writeto(file_list[j].replace('.fits', '.bias.fits')) 
+            else: print_log("# File bias corr already done "+file_list[j])
+        #endfor
+    #endif
+#end of median_filter module
+
+def det_norm(file_list, filt): #added on 08/28/09 @4:15P
+    print_log('#det_norm(): Account for sensitivity variations between chips'+gettime())
+    print_log('#Scaling by EXPTIME first. LT files will be in ADU/s'+gettime())
+    etime = run_gethead('-f EXPTIME', prefix, 'LT*.fits')
+    fsample = run_gethead('-f FSAMPLE', prefix, 'LT*.fits')
+
+    if filt == 'J' or filt == 'F1187N' or filt == '1190': 
+        scale = [0.758816, 0.879655, 1.000, 0.971768] #as of 11/22/09 10PM
+        #scale = [0.751623, 0.895365, 1.000, 0.954993]
+    if filt == 'H':
+        scale = [0.765221, 0.758156, 1.000, 0.941566] #as of 11/22/09 10PM
+    if filt == 'K' or filt == 'Ks' or filt == 'F2096N' or filt == '2095':
+        scale = [1.000000, 0.8202, 1.000000, 0.8966]
+        #scale = [1.000000, 0.850000, 1.000, 0.910000] #as of 12/20/10 ???? based on timestamp, rough estimate
+        #scale = [0.917563, 0.826024, 1.000, 0.894012] #as of 11/22/09 10PM
+    matrix = ['CD1_1', 'CD1_2', 'CD2_1', 'CD2_2']
+    for j in range(len(file_list)):
+        if len(iraf.hedit(file_list[j]+'['+str(1)+']','DO_ZPT','.', Stderr=1)) == 0: dozpt = 1
+        else: dozpt = 0
+        if len(iraf.hedit(file_list[j]+'['+str(1)+']','DETIME','.', Stderr=1)) == 0: doexp = 1
+        else: doexp = 0
+        if dozpt == 1 or doexp == 1:
+            hdulist = pyfits.open(file_list[j], mode='update')
+            for k in dets:
+                #print j, k, file_list[j]
+                # The following avoids 'Card image is not FITS standard (unparsable value string)'. Deletes comment info
+                for key in matrix: hdulist[k].header.update(key, hdulist[k].header[key], '')
+                
+                #commented out since I don't want to do this now
+                #if hdulist[k].header['PSF-X'] == 0.0 or hdulist[k].header['PSF-Y'] == 0.0:
+                #    hdulist[k].header.update('WEIGHT', '0.0', '') #avoid Card image problem with Inf weight
+
+                if dozpt == 1:
+                    hdulist[k].data = (hdulist[k].data)/scale[k-1] #divide by scale. Changed on 09/02/09 @9:36PM. typo
+                    hdulist[k].header.update('DO_ZPT', 1)
+                else:
+                    if k == 1: print_log("#det_norm() previously completed for "+file_list[j])
+                if doexp == 1:
+                    hdulist[k].data = (hdulist[k].data)/(etime[j]*fsample[j])
+                    txt = 'exp %5.1f fsample %3.1f' % (etime[j], fsample[j])
+                    print_log(txt, 0)
+                    hdulist[k].header.update('DETIME', 1)
+                else:
+                    if k == 1: print_log("#Already scaled by EXPTIME+FSAMPLE: "+file_list[j])
+            #endfor
+            hdulist.flush()
+        else: print_log("#det_norm() and scaling by EXPTIME+FSAMPLE DONE!!: "+file_list[j])
+    #endfor
+#end of det_norm module
+
+def check_field_files(sci_list, sci_stack, flat, ref_im):
+    if not exists(sci_list): print sci_list + nofile_err
+    if not exists(sci_stack): print sci_stack + nofile_err
+    if not exists(flat): print flat + nofile_err
+    if not exists(ref_im): print ref_im + nofile_err
+#end of check_field_files module
+
+def list_define(sci_list):
+    scifile=[]; rawfile=[]; maskfile=[]; obmfile=[]; obmfile2=[]; rejfile=[]; sub2file=[]; subfile=[]; ltfile=[]
+    f0 = open(sci_list, 'r'); files0 = f0.readlines(); f0.close(); nfiles = len(files0)
+    for j in range(nfiles):
+        scifile.append(files0[j].replace('\n','')) #T_raw*.fits
+        rawfile.append(scifile[j].replace('T_', '')) # raw*.fits
+        maskfile.append(pdir+'/'+rawfile[j].replace('.fits','_msk.fits')) #raw/pmask/raw*_msk.fits
+        rejfile.append(rawfile[j].replace('.fits', '_rej.fits')) #raw*_rej.fits
+        obmfile.append(prefix+'/'+scifile[j].replace('T_','obmT_')) #prefix/obm2T_raw*.fits
+        obmfile2.append(prefix+'/'+scifile[j].replace('T_','obm2T_')) #prefix/obm2T_raw*.fits
+        subfile.append(prefix+'/'+scifile[j].replace('T_','ss1LT_')) #prefix/ss1LT_raw*.fits
+        sub2file.append(prefix+'/'+scifile[j].replace('T_','sss1LT_')) #prefix/sss1LT_raw*.fits
+        ltfile.append(prefix+'/'+scifile[j].replace('T_','LT_')) #prefix/LT_raw*.fits
+    #endfor
+    filt0 = str(pyfits.getheader(scifile[0])['FILTER']); nbfilt_flag = 0
+    for ll in range(len(nb_filter)):
+        if filt0.find(nb_filter[ll]) != -1: nbfilt_flag = 1
+    #endfor
+    return nbfilt_flag,nfiles,filt0,scifile,rawfile,maskfile,rejfile,obmfile,obmfile2,subfile,sub2file,ltfile
+#end of list_define module
+
+def update_weight(prefix, scifile, pref):
+    #Run in wcs_zpt_weight. Determines WEIGHT, FWHM0 and SKY value and update ss1LT or sss1LT files
+    print_log("#Running update_weight"+gettime())
+    #sky = run_gethead('-f SKYMODE', prefix, pref+'T*.fits')
+    fwhmdata  = numpy.zeros((nfiles,4)); skydata = numpy.zeros((nfiles,4))
+    for k in dets:
+        txt = "-x "+str(k)+" "+prefix+"/"+pref+"T*.fits" # | grep -v orig | awk '{print $2}'" ###SET to sss1LT since the wcs files do not exist yet!!! This is only for Janice's datasets
+        #if k == 1: print txt
+        fwhmdata0 = commands.getstatusoutput("gethead -f FWHM "+txt)[1].split('\n') #FWHM is det dependent
+        skydata0 = commands.getstatusoutput("gethead -f SKYMODE "+txt)[1].split('\n')
+        #print fwhmdata0, skydata0
+        #n_nofwhm = fwhmdata0.count('___')
+        if len(fwhmdata0) != nfiles:
+            print "# FWHM info not available for all : "+str(len(fwhmdata0))+' != '+str(nfiles)+' det: '+str(k)
+            
+            #list1 = commands.getstatusoutput("gethead FWHM  "+prefix+"/"+pref+"T*.fits | awk 'BEGIN{FS=\"[\"} {print $1}'")[1].split('\n')
+            list1 = commands.getstatusoutput("gethead FWHM  "+prefix+"/"+pref+"T*.fits | awk '{print $1}'")[1].split('\n')
+            #print list1[0]
+            list2 = commands.getstatusoutput("ls -1 "+prefix+"/"+pref+"T*.fits | awk 'BEGIN{FS=\"/\"} {print $2}'")[1].split()
+            #print list2[0]
+            z1 = numpy.zeros(len(list2))
+            for jj in range(len(list2)):
+                for kk in range(len(list1)):
+                    if list2[jj] == list1[kk]: z1[jj]=1
+                #endfor
+            #endfor
+            save = numpy.where(z1 == 1); save = save[0]
+            bad = numpy.where(z1 == 0); bad = bad[0]
+        else: save = range(nfiles)
+
+        for i in range(len(save)): fwhmdata[save[i]][k-1] = fwhmdata0[i]
+        for i in range(nfiles): skydata[i][k-1]  = skydata0[i]
+    #endfor
+    #print fwhmdata, skydata
+
+    fwhm = numpy.zeros(nfiles); sky = numpy.zeros(nfiles)
+    for i in range(nfiles):
+        fwhm[i] = numpy.min(fwhmdata[i]); sky[i] = numpy.average(skydata[i])
+    #endfor
+
+    wht = 1/(sky * numpy.pi*(fwhm*0.4)**2/4.0) # fwhm is in pixel -> arcsec
+    inf_wht = (numpy.where(numpy.isinf(wht) == True))[0]
+    wht[inf_wht] = 0.0 #; print inf_wht
+    for i in save: #range(nfiles):
+        for k in dets:
+            cmdt="iraf.hedit('%s/%s%s[im%i]','WEIGHT',%f,add='yes',veri='no',show='no', %s)" % (prefix,pref,scifile[i],k, wht[i], std_log)
+            pycmd(cmdt, scr=0)
+            cmdt="iraf.hedit('%s/%s%s[im%i]','SKY',%f,add='yes',veri='no',show='no', %s)" % (prefix,pref,scifile[i],k, sky[i], std_log)
+            pycmd(cmdt, scr=0)
+            cmdt="iraf.hedit('%s/%s%s[im%i]','FWHM0',%f,add='yes',veri='no',show='no', %s)" % (prefix,pref,scifile[i],k, fwhm[i], std_log) #FWHM0 = best FWHM
+            pycmd(cmdt, scr=0)
+        #endfor
+    #endfor
+    return save
+#end of update_weight module
+
+def wcs_zpt_weight(stage):
+    if stage == 1: pref1 = 'ss1L'; tpref='wcsL';  nrange=range(5)
+    if stage == 2:
+        temp = (commands.getstatusoutput('ls '+prefix+'/wcs*.fits'))[0]
+        if temp == 0:
+            pref1 = 'wcsL'; tpref='sss1L'; nrange=dets
+        else: pref1='sss1L'; tpref='wcsL'; nrange=range(5)
+        print temp, nrange
+
+    for k in nrange:
+        awkcmd1 = "awk '{print \"%s/%s\" $0 \"[%i]\"}' < %s > list1" % (prefix,tpref, k, sci_list)
+        awkcmd2 = "awk '{print \"%s/%s\" $0 \"[%i]\"}' < %s > list2" % (prefix,pref1, k, sci_list)
+        if k == 0: cmd6b = "iraf.imcopy('@list2', '@list1', %s)" % std_log
+        else: cmd6b = "iraf.wcscopy('@list1', '@list2', %s)" % std_log
+        unix_exec(awkcmd1); unix_exec(awkcmd2); pycmd(cmd6b)
+        #if stage == 2 and temp !=0: iraf.hedit('@list2','EXTVER',str(k),add='yes',veri='no',show='no')
+    #endfor
+    if pref1 != 'wcsL': save_good = update_weight(prefix, scifile, pref1) #runs only once after nfwcs is done
+    #print save_good
+
+    for k in dets:
+        cmd_ghead = 'gethead -f -x '+str(k)+' '+' '.join(zpt_keywords)+' '+prefix+'/'+pref1+'*.fits | awk \'NF == 13 {print $0}\' > '+prefix+'_ghead.dat '
+        unix_exec(cmd_ghead); gdata=asciidata.open(prefix+'_ghead.dat') #ghead0=commands.getstatusoutput(cmd_ghead); 
+        #print nfiles, len(gdata[0])
+        if pref1 == 'wcsL': save_good = range(numpy.min([nfiles, len(gdata[0])]))
+        for j in range(numpy.min([nfiles, len(gdata[0])])):
+            hdulist = pyfits.open(prefix+'/'+tpref+scifile[save_good[j]], mode='update')
+            for l in range(len(zpt_keywords)): hdulist[k].header.update(zpt_keywords[l], gdata[l][j], '')
+            hdulist.flush()
+        #endfor
+    #endfor
+#end of wcs_zpt_weight()
+
+def zpt_info(det):
+    tzpt=run_gethead('-f MAGZERO1 -x '+str(det),prefix,'ss1LT*.fits'); tsig=run_gethead('-f MAGZSIG1 -x '+str(det),prefix,'ss1LT*.fits')
+    terr=run_gethead('-f MAGZERR1 -x '+str(det),prefix,'ss1LT*.fits'); tnav=run_gethead('-f MAGZNAV1 -x '+str(det),prefix,'ss1LT*.fits')
+
+    if len(tzpt) != nfiles:
+        z1 = numpy.zeros(nfiles)
+        txt = "-x "+str(det)+" "+prefix+"/ss1LT*.fits"
+        list1 = commands.getstatusoutput("gethead MAGZERO1 "+txt+" | awk 'BEGIN{FS=\"[\"} {print $1}'")[1].split('\n')
+        list2 = commands.getstatusoutput("ls -1 "+prefix+"/ss1LT*.fits | awk 'BEGIN{FS=\"/\"} {print $2}'")[1].split()
+        for jj in range(len(list2)):
+            for kk in range(len(tzpt)):
+                if list2[jj] == list1[kk]: z1[jj]=1
+            #endfor
+        #endfor
+        save = numpy.where(z1 == 1); save = save[0]
+        bad = numpy.where(z1 == 0); bad = bad[0]
+    else: save = range(nfiles)
+
+    return tzpt, tsig, terr, tnav, save
+#end of zpt_info module
+
+def weights_zpt(prefix, save): #change to sss1 and also using just extension 1
+#    print "SAVE ; ", save #; print save[0][0]
+    etime = run_gethead('-f EXPTIME', prefix, 'rsss1LT*.fits')
+    txt = "sss1LT*.fits | grep -v orig | awk '{sub(/\[1\]/,\"\"); print $2}'"
+    weight = run_gethead("-x 1 WEIGHT ", prefix, txt) # weight=commands.getstatusoutput("gethead WEIGHT "+txt)[1].split('\n')
+#    print weight
+    sky = run_gethead("-x 1 SKY ", prefix, txt) # sky = commands.getstatusoutput("gethead SKY "+txt)[1].split('\n')
+    aweight=float(numpy.average(weight[save])); asky=float(numpy.sum(weight[save]*sky[save])/numpy.sum(weight[save]))
+
+    psf = run_gethead('-x 1 FWHM0 ', prefix, txt) #psf = commands.getstatusoutput("gethead FWHM0 "+txt)[1].split('\n')
+    zpts = run_gethead('-x 1 MAGZERO ', prefix, txt) #zpts = commands.getstatusoutput("gethead MAGZERO "+txt)[1].split('\n')
+#    print psf; print zpts
+    apsf=float(numpy.sum(weight[save]*psf[save])/numpy.sum(weight[save]))
+
+    zpt_ref = zpts[save[0]]; zpt_scale = 10**(-0.4*(zpts-zpt_ref)) #flip the order on 1/19/10 @1:53P. This was a typo
+    
+    text="### Avg weight: %f  PSF %f  SKY %f  Relative ZPT %s" % (aweight, apsf, asky, zpt_ref); print_log(text)
+    print "LEN of SAVE : ", len(save)
+    print_log("WEIGHT FWHM SKY MAGZERO WEXPTIME")
+    for j in range(len(save)): #range(nfiles):
+        wexptime = etime[save[j]]*(weight[save[j]]/aweight) #; txt = '%f' % wexptime; print txt
+        txt = '#%03i %f %f %f %f %f \t%s' % (save[j],weight[save[j]],psf[save[j]],sky[save[j]],zpts[save[j]],wexptime,scifile[save[j]]); print_log(txt)
+        cmd16d = "iraf.hedit('%s/rsss1L%s','ZSCALE','%f',add='yes',veri='no', %s)" % (prefix,scifile[save[j]], zpt_scale[save[j]], std_log)
+        pycmd(cmd16d, scr=0)
+        cmd16d = "iraf.hedit('%s/rsss1L%s','WEXPTIME','%f',add='yes',veri='no', %s)" % (prefix,scifile[save[j]], wexptime, std_log)
+        pycmd(cmd16d, scr=0)
+    #endfor
+    return aweight, apsf, asky, zpt_ref
+#end weights_zpt module
+
+def run_nfwcs(pref):
+    print_log('#Calibrate astrometry'+gettime())
+    twomass_cat = prefix+'/twomass_radec.txt'
+    if exists(twomass_cat): commands.getstatusoutput('rm -f '+twomass_cat)
+    cmd6a= "iraf.nftwomass('%s/%s//@%s','%s',search=300.0)" % (prefix,pref,sci_list, twomass_cat)
+    cmd6 = "iraf.nfwcs('%s/%s//@%s',coords='%s', %s)" % (prefix,pref,sci_list, twomass_cat, std_log)
+    if do_run: pycmd(cmd6a); pycmd(cmd6)
+    else: print_log(cmd6a); print_log(cmd6)
+#end of run_nfwcs module
+
+def make_crmask(file, sci_stack, prefix):
+    print_log("#Make CR rejection masks for "+sci_stack+" series"+gettime())
+    iraf.mscimage.form='image'; iraf.mscimage.pixmas='no'; iraf.mscimage.fluxcon=NO
+    iraf.mscimage.wcs='match'; iraf.mscimage.bound='constant'
+
+    list0 = "list1.tmp"; list2 = "list2.tmp"; list1 = "doall_tmp1.cl"
+    
+    detsec = ['[1:2046,1:2046]','[2047:4092,1:2046]','[1:2046,2047:4092]', '[2047:4092,2047:4092]']
+    cmd8a = "iraf.imslice('%s_rej', '%s_rej_', slice_dimens=3, %s)" % (file, file, std_log) #, std_log)
+    cmd8b = "iraf.delete('%s', veri='no', %s)" % (list0, std_log) #cmd8c = "iraf.delete('%s', veri='no')" % list1
+    cmd8c = "ls "+file+"_rej_* > "+list0
+    cmd8d = "iraf.imreplace('@%s', 1000, low=1, up='indef', %s)" % (list0, std_log)
+    cmd8e = "awk '{sub(/.fits/, \"_rejmsk.fits\"); print \"rss1L\" $0}' < "+sci_stack+" > "+list2
+    if do_run:
+        pycmd(cmd8a); pycmd(cmd8b); unix_exec(cmd8c);
+        pycmd(cmd8d); unix_exec(cmd8e)
+        crmasks = (commands.getstatusoutput('cat '+list0))[1].split('\n')
+        crmask_proj = (commands.getstatusoutput('cat '+list2))[1].split('\n')
+        print_log("# Copying over WCS"+gettime())
+        for j in range(len(crmasks)):
+            cmd8f = "iraf.wcscopy('%s', '%s',%s)" % (crmasks[j], file+'.fits', std_log); pycmd(cmd8f, scr=0)
+        #endfor
+        cmd8g = "iraf.imrename('@%s', '@%s', ver='yes',%s)" % (list0, list2, std_log); pycmd(cmd8g)
+        print_log("# De-project rejmasks to MEF format"+gettime())
+        for j in range(len(crmasks)):
+            infile0 = prefix+'/'+crmask_proj[j].replace('_rejmsk', '').replace('rss1', 'ss1') #ss1LT_*.fits
+
+            outfile0 = crmask_proj[j].replace('rss1L', '') #T_*rejmsk.fits
+            outfile1 = crmask_proj[j].replace('.fits','') #ss1LT_*_rejmask. no .fits
+            if j == 0: print "###", infile0, outfile0, outfile1
+            cmd8h = "iraf.imcopy('%s[0]','%s[0,append]',ver='yes',%s)" % (infile0, outfile0, std_log)
+            pycmd(cmd8h, scr=0)
+            cmd8h="iraf.hedit('%s[0]','BITPIX',16,veri='no',update='yes')" % (outfile0); pycmd(cmd8h,scr=0)
+            for k in dets:
+                cmd8i="iraf.mscimage('%s','%s_%i', ref='%s[%i]',%s)" % (crmask_proj[j], outfile1,k,
+                                                                        infile0,k, std_log)
+                cmd8j="iraf.imcopy('%s_%i','%s[%i,append]',ver='yes',%s)" % (outfile1,k, outfile0,k, std_log)
+                pycmd(cmd8i, scr=0); pycmd(cmd8j, scr=0)
+            #endfor
+            cmd8k="iraf.imdelete('%s_*.fits',ver='no',%s)" % (outfile1, std_log); pycmd(cmd8k, scr=0)
+
+            hdulist = pyfits.open(outfile0, mode="update")
+            hdulist[0].header['BITPIX'] = 8
+            for k in dets:
+                data0 = hdulist[k].data; data0[numarray.nonzero(data0)]=numpy.uint8(1)
+                hdulist[k].data = numpy.uint8(data0); hdulist[k].header['BITPIX'] = 8
+                hdulist[k].header['GAIN'] = 0; hdulist[k].header['RDNOISE'] = 0
+                hdulist[k].header.update('DETSEC', detsec[k-1])
+            #endfor
+            hdulist.flush()
+        #endfor
+        cmd8k="iraf.imdelete('rss1*rejmsk.fits',ver='no',%s)" % (std_log); pycmd(cmd8k, scr=0)
+    else:
+        print_log(cmd8a); print_log(cmd8b); print_log(cmd8c);
+        print_log(cmd8d); print_log(cmd8e); print_log(cmd8g)
+#end of make_crmask module
+
+def make_obm2T_files():
+    print_log("#Making obm2T files"+gettime())
+    testfile = prefix+'_obm2T_test.fits'
+    if exists(badpix.replace('.fits','_grow.fits')):
+        print badpix.replace('.fits','_grow.fits')
+        bpmgrowlist = pyfits.open(badpix.replace('.fits','_grow.fits'))
+
+        for j in range(nfiles):
+            if not exists(prefix+'/obm2'+scifile[j]): # or not exists(prefix+'/obm2'+scifile[j]+'.gz'):
+                hdulist = pyfits.open(obmfile[j])
+                if flag_val[20]: trejfile = rejfile[j]
+                else: trejfile = maskfile[j]
+
+                if exists(testfile): commands.getstatusoutput('rm -f '+testfile)
+                if exists(trejfile):
+                    cmd1 = "iraf.imcopy('%s[0]','%s[0,append]',ver='yes',%s)" % (obmfile[j],testfile,std_log)
+                    pycmd(cmd1, scr=0)
+                    for k in dets:
+                        cmd1a = "iraf.imcopy('%s[%i]','%s[%i,append]',ver='yes',%s)" % (trejfile,k, testfile,k, std_log)
+                        pycmd(cmd1a, scr=0)
+                    #endfor
+                    rejlist = pyfits.open(testfile)
+                    for k in dets:
+                        data = hdulist[k].data
+                        static = numpy.where(bpmgrowlist[k].data == 1)
+                        (rejlist[k].data)[static]=0
+                        rej = numpy.where(rejlist[k].data > 0); data[rej] = 1
+                        hdulist[k].data = data
+                        hdulist[k].header['GAIN'] = 0; hdulist[k].header['RDNOISE'] = 0
+                        del hdulist[k].header['CD1_1,CD'] #delete this as it causes problems with writeto
+                    #endfor
+                    hdulist.writeto(obmfile2[j])
+                else: print_log('#'+trejfile+" not found!!!")
+            else: print_log('#'+prefix+'/obm2'+scifile[j]+" found!!!")
+        #endfor
+    else: print '#'+badpix.replace('.fits','_grow.fits')+' not found!!!'
+#end of make_obm2T_files module
+
+def run_combine(stage):
+    pycmd("iraf.unlearn('imcombine')")
+    iraf.imcombine.offsets='wcs'; iraf.imcombine.masktype='goodvalue'; iraf.imcombine.maskval=0; iraf.imcombine.blank=0
+    if stage == 1: #first-pass
+        iraf.imcombine.combine='median'; iraf.imcombine.reject='avsigclip'; 
+        iraf.imcombine.lsigma=5; iraf.imcombine.hsigma=5; iraf.imcombine.mclip=YES #adopting 5sigma as of 02/22/10 @2:36PM
+        print_log('#First pass stack combine (edit list to remove unwanted frames)'+gettime())
+        stack_pref0 = stack_pref
+        sci_stack2 = sci_stack # sci_list # to generate CRs for *all* frames. Temporary modificaton on 12/18/10
+    #endif
+    if stage == 2: #second-pass
+        print_log('#Second pass stack combine'+gettime())
+        stack_pref0 = stack_pref2
+        sci_stack2 = sci_stack
+        blank_image = ref_im.replace('.fits','_blank.fits')
+        if not exists(blank_image):
+            print_log('#Creating blank image'+gettime())
+            hdulist = pyfits.open(ref_im)
+            z0 = numpy.zeros((hdulist[0].header['NAXIS1'],hdulist[0].header['NAXIS2']),dtype=uint8)
+            hdulist[0].data = z0; hdulist[0].header['BITPIX']=8
+            crpix1 = round(hdulist[0].header['CRPIX1']); crpix2 = round(hdulist[0].header['CRPIX2'])
+            print_log("# Rounding CRPIX1/CRPIX2 to "+str(crpix1)+" "+str(crpix2))
+            hdulist[0].header.update('CRPIX1', crpix1)
+            hdulist[0].header.update('CRPIX2', crpix2)
+            hdulist.writeto(blank_image)
+        else: print_log('#'+blank_image+' already exists!!!')
+    #endif
+
+    nlimit = 100 # 118 #limit at which to split things
+    if nfiles >= nlimit:
+        #bin = numpy.min([numpy.ceil(nfiles/2.0), 100.0]) #at most bin = 100
+        cycles=numpy.ceil(nfiles/100.) #breaking by increments of bin sizes; bin must be a floating point
+        bin = numpy.ceil(nfiles/cycles); bin = int(bin);
+        cycles=int(cycles)
+        beg0=range(0, bin*cycles, bin)
+        end0=range(bin, bin*(cycles+1), bin)
+        end0[cycles-1]=nfiles
+        print_log("#Input list is too large. Will split it. There will be "+str(cycles)+" cycles.")
+    else:
+        cycles=1; beg0=[0]; end0=[nfiles]
+
+    for cc in range(cycles):
+        if cycles != 1: print_log("# Working on Cycles #"+str(cc)+gettime())
+        if cycles > 1:
+            new_sci_stack = '%s.%i' % (sci_stack2, cc); tprefix = '%s/%s-%i' % (prefix, stack_pref0, cc)
+            hedit_files = ['/*Stack2-'+str(cc)+'*', '/*mosaic'+str(cc)+'*']
+            mosaic_file = '%s/%s_mosaic%i_sci.fits' % (prefix, prefix, cc)
+            mosaic_expfile = '%s/%s_mosaic%i_exp.fits' % (prefix, prefix, cc)
+            awkcmd = "awk 'NR > %i && NR <= %i {print}' < %s > %s" % (beg0[cc],end0[cc], sci_stack2, new_sci_stack)
+            unix_exec(awkcmd)
+        else:
+            new_sci_stack = sci_stack2; tprefix = '%s/%s' % (prefix, stack_pref0)
+            hedit_files = ['/*Stack2*', '/*mosaic*']
+            mosaic_file = '%s/%s_mosaic_sci.fits' % (prefix, prefix)
+            mosaic_expfile = '%s/%s_mosaic_exp.fits' % (prefix, prefix)
+
+        if check_for_file(tprefix, '.fits') == 'True':
+            if stage == 1:
+                cmd8="iraf.imcombine('%s/rss1L//@%s','%s',expmask='%s_exp',rejmask='%s_rej', %s)" % (prefix,new_sci_stack, tprefix,
+                                                                                                     tprefix, tprefix, std_log)
+                cmd9a=""
+            #endif
+            #tfiles = (commands.getoutput('gethead -f FILENAME '+prefix+'/rsss1*.fits')).split('\n') #the full list
+            if stage == 2:
+                cmd8="iraf.imcombine('%s/rsss1L//@%s','%s',expmask='%s_exp',%s)" % (prefix,new_sci_stack, tprefix, tprefix, std_log)
+                f3 = open(sci_list, 'r'); tfiles = f3.readlines(); f3.close()
+                g3 = open(new_sci_stack, 'r'); files3 = g3.readlines(); g3.close()
+                if len(files3) != len(tfiles):
+                    print_log("#Lists are different "+str(len(tfiles))+" > "+str(len(files3)))
+                    z1 = numpy.zeros(len(tfiles))
+                    for j in range(len(tfiles)):
+                        for k in range(len(files3)):
+                            if tfiles[j] == files3[k]: z1[j]=1
+                        #endfor
+                    #endfor
+                    save = numpy.where(z1 == 1)
+                    save = save[0]
+                else:
+                    print_log("Lists are identical. NO frames removed")
+                    save = range(len(tfiles)) #use all of them
+                #endelse
+                cmd9a="iraf.imcombine('@regrid.lis','%s', %s)" % (mosaic_file, std_log)
+                cmd9b="iraf.imcombine('@regrid2.lis','%s', %s)" % (mosaic_expfile, std_log)
+            #endif
+
+            #endif
+            if do_run:
+                if stage == 2:
+                    aweight, apsf, asky, zpt_ref = weights_zpt(prefix, save)
+                    iraf.imcombine.combine='average'; iraf.imcombine.lthresh=-1000; iraf.imcombine.hthresh=60000;
+                    iraf.imcombine.weight='!weight'; iraf.imcombine.scale='!zscale'; iraf.imcombine.expname='WEXPTIME'
+                    iraf.imcombine.reject='avsigclip';
+                    iraf.imcombine.lsigma=sigma_limit; iraf.imcombine.hsigma=sigma_limit #avsigclip for extreme outliers that are missed
+                    print_log("#imcombine.lsigma = "+str(iraf.imcombine.lsigma)); print_log("#imcombine.hsigma = "+str(iraf.imcombine.hsigma));
+                    iraf.imcombine.mclip='yes' #; iraf.imcombine.nhigh=round(0.02*(end0[cc]-beg0[cc])) #adopting 2% and rounding to nearest integer
+                #endif
+                pycmd(cmd8)
+
+                if stage == 2:
+                    #Below is intended to create 
+                    iraf.imcombine.combine='sum'; iraf.imcombine.lthresh='INDEF'; iraf.imcombine.hthresh='INDEF'
+                    iraf.imcombine.weight='none'; iraf.imcombine.scale='none'; iraf.imcombine.expname=''
+                    iraf.imcombine.reject='none'
+                    unix_exec('ls '+tprefix+'.fits '+blank_image+' > regrid.lis'); pycmd(cmd9a)
+                    unix_exec('ls '+tprefix+'_exp.pl '+blank_image+' > regrid2.lis'); pycmd(cmd9b)
+                    ncomb0 = float(commands.getstatusoutput('gethead '+tprefix+'.fits NCOMBINE')[1]) #ncomb0 = int(iraf.hedit(tprefix+'.fits','NCOMBINE','.', Stderr=1))
+                    cmd = "iraf.hedit('%s%s', 'NCOMBINE', %i, veri='no', update='yes', %s) " % (prefix, hedit_files[1], ncomb0, std_log); pycmd(cmd)
+                    
+                    
+                    for set in hedit_files:
+                        pycmd("iraf.hedit('%s', 'AWEIGHT', %f, add=YES,veri=NO, %s)" % (prefix+set, aweight, std_log))
+                        pycmd("iraf.hedit('%s', 'ASKY', %f, add=YES, veri=NO, %s)" % (prefix+set, asky, std_log))
+                        pycmd("iraf.hedit('%s', 'APSF', %f, add=YES, veri=NO, %s)" % (prefix+set, apsf, std_log))
+                        pycmd("iraf.hedit('%s', 'MAGZP', %f, add=YES, ver=NO, %s)" % (prefix+set, zpt_ref, std_log))
+                    #endfor
+                    unix_exec('gzip -f '+prefix+'/'+prefix+'_mosaic*_exp.fits ') #+prefix+'/'+stack_pref2+'.fits')
+            else:
+                print_log(cmd8)
+                if cmd9a != '': pycmd(cmd9a); pycmd(cmd9b)
+            #endelse
+        else: print_log('#Will not run DO_COMB as file EXISTS'+gettime())
+        if stage == 1: make_crmask(tprefix, new_sci_stack, prefix)
+    #endfor
+
+    if cycles > 1 and stage == 1: #this is for combining images by taking the total for a reliable object mask
+        iraf.imcombine.combine='sum'
+        if not exists(prefix+'/'+stack_pref0+'.fits'):
+            cmd8a="iraf.imcombine('%s/%s-?.fits','%s/%s', %s)" % (prefix,stack_pref0, prefix,stack_pref0, std_log)
+            cmd8b="iraf.imcombine('%s/%s-?_exp.pl','%s/%s_exp.pl', %s)" % (prefix,stack_pref0, prefix,stack_pref0, std_log)
+            if do_run:
+                pycmd(cmd8a); pycmd(cmd8b)
+            else:
+                print_log(cmd8a); print_log(cmd8b)
+        #if stage == 2: print_log("# Come back and combine the two")
+        else: print_log('#Will not run DO_COMB1 part2 as file EXISTS'+gettime())
+
+#end of run_combine module
+
+def make_rej_mask(stage):
+    if flag_val[20]: # combining BPM with PMASK --> rej.fits
+        if stage == 0: print_log('#Combining BPM with User\'s PMASK'+gettime())
+        for j in range(nfiles): 
+            if exists('test.fits'): test = commands.getstatusoutput('rm -f test.fits')
+            cmd4a = "iraf.mscarith('%s','+','%s','test.fits',pixtype='short')" % (badpix,maskfile[j])
+            if do_run:
+                if stage == 0:
+                    pycmd(cmd4a, scr=0); #print cmd4a
+                    if exists(rejfile[j]): test=commands.getstatusoutput('rm -f '+rejfile[j])
+                    iraf.imcopy(input='test.fits[0]', output=rejfile[j], verbose='no')
+                #endif
+                for k in dets:
+                    if stage == 0:
+                        cmd4b="iraf.imcopy('test.fits[%i]','%s[type=mask,append,inherit]',verbose='no')" % (k,rejfile[j])
+                        exec(cmd4b)
+                    else:
+                        if stage == 1:
+                            if j == 0:
+                                txt = 'MAKE_REJ_MASK: %s/ss1L%s[%i] %s[%i] %s\n' % (prefix,scifile[j],k, badpix,k, gettime())
+                                bpm_notes(txt) #make a note of changes.
+                            #endif
+                            cmd4c="iraf.hedit('%s/ss1L%s[%i]','BPM','%s[%i]',ver='no',show='no',add='yes')" % (prefix,scifile[j],k, badpix,k)
+                        if stage == 2:
+                            if j == 0:
+                                txt = 'MAKE_REJ_MASK: %s/sss1L%s[%i] %s[%i] %s\n' % (prefix,scifile[j],k, rejfile[j],k, gettime())
+                                bpm_notes(txt) #make a note of changes.
+                            #endif
+                            cmd4c="iraf.hedit('%s/sss1L%s[%i]','BPM','%s[%i]',ver='no',show='no',add='yes')" % (prefix,scifile[j],
+                                                                                                                k,rejfile[j],k)
+                        #endif
+                        exec(cmd4c)
+                        #print cmd4c
+                    #endelse
+                #endfor
+            else: print cmd4a #; print cmd4b
+        #endfor
+    else: # Just use _msk.fits file
+        if do_run:
+            for j in range(nfiles):
+                for k in dets:
+                    if stage == 0:
+                        cmd="iraf.imcopy('test.fits[%i]','%s[type=mask,append,inherit]',verbose='no')" % (k,maskfile[j])
+                        exec(cmd)
+                    else:
+                        if stage == 1:
+                            if j == 0:
+                                txt = 'MAKE_REJ_MASK: %s/ss1L%s[%i] %s[%i] %s\n' % (prefix,scifile[j],k, badpix,k, gettime())
+                                bpm_notes(txt) #make a note of changes.
+                            #endif
+                            cmd="iraf.hedit('%s/ss1L%s[%i]','BPM','%s[%i]',ver='no',show='no',add='yes')" % (prefix,scifile[j],k, badpix,k)
+                        if stage == 2:
+                            if j == 0:
+                                txt = 'MAKE_REJ_MASK: %s/sss1L%s[%i] %s[%i] %s\n' % (prefix,scifile[j],k, maskfile[j],k, gettime())
+                                bpm_notes(txt) #make a note of changes.
+                            #endif
+                            cmd="iraf.hedit('%s/sss1L%s[%i]','BPM','%s[%i]',ver='no',show='no',add='yes')" % (prefix,scifile[j],k,
+                                                                                                              maskfile[j],k)
+                        #endif
+                        exec(cmd)
+                    #endelse
+                #endfor
+            #endfor
+        #endif
+    #endelse
+#end of make_rej_mask module
+
+def reproject_images(stage):
+    #if check_for_file(prefix+'/rss1LT_', '.fits') == 'True':
+    #if check_for_file(prefix+'/rsss1LT_', '.fits') == 'True':
+    iraf.mscimage.interpol='linear'; iraf.mscimage.ntrim=10.0 # trim the edges by 10 pixels as of 02/22/10 @ 2:36P
+    if stage == 1:
+        print_log('#Reproject the first-pass sky-subtracted images'+gettime())
+        print_log('#Updating FITS headers with photometric info'+gettime())
+        pref0 = '/rss1L'; pref1 = 'ss1L'
+    #endif
+    if stage == 2:
+        print_log('#Reproject the second-pass sky-subtracted images'+gettime())
+        pref0 = '/rsss1L'; pref1 = 'sss1L'
+        if do_sinc_interp: iraf.mscimage.interpol='sinc' #only do for 2nd pass files
+        #else: iraf.mscimage.interpol='linear'
+    #endif
+
+    iraf.mscimage.format='image'; iraf.mscimage.pixmask=YES; iraf.mscimage.verbose=YES
+    iraf.mscimage.ra=field_ra/15.0; iraf.mscimage.dec=field_dec
+    iraf.mscimage.scale=0.4; iraf.mscimage.rotation=0 #arcsec/pix
+    iraf.mscimage.blank=0; iraf.mscimage.minterp='linear'; iraf.mscimage.boundary='reflect'
+    iraf.mscimage.constant=0; iraf.mscimage.fluxcon=NO; iraf.mscimage.ntrim=0
+
+    if stage == 2 and do_sinc_interp: print_log("# Fixpixing the images"+gettime())
+    for j in range(nfiles):
+        if not exists(prefix+pref0+scifile[j]):
+            if not j % 5:
+                txt = "# Working on %3i %s %s" % (j, scifile[j], gettime()); print_log(txt)
+            #endif
+            if stage == 2 and do_sinc_interp:
+                orig_skysub = '%s/%s%s' % (prefix, pref1, scifile[j].replace('.fits','.orig.fits'))
+                fixpix_skysub = '%s/%s%s' % (prefix, pref1, scifile[j])
+                if not exists(orig_skysub):
+                    cmd7a="cp -a %s/%s%s %s" % (prefix, pref1, scifile[j], orig_skysub)
+                    if do_run: unix_exec(cmd7a, scr=0)
+                    for k in dets:
+                        cmd7b="iraf.fixpix('%s[%i]','%s[%i]',verbose='yes',%s)" % (fixpix_skysub,k, scifile[j].replace('.fits','_rej.fits').replace('T_',''), #changed this to *_rej.fits
+                                                                                   k, std_log)
+                        if do_run: pycmd(cmd7b, scr=0)
+                    #endfor
+                #endif
+            #endif
+            cmd7 ="iraf.mscimage('%s/%s//%s','%s/r%s//%s',wcssour='parameters',%s)" % (prefix,pref1,scifile[j],
+                                                                                       prefix,pref1,scifile[j], std_log)
+            if do_run: pycmd(cmd7, scr=0) #; pycmd(cmd7b); pycmd(cmd7c)
+            else: print_log(cmd7) #; print_log(cmd7b); print_log(cmd7c)
+        else: print_log('#File exists: '+prefix+pref0+scifile[j]+gettime())
+    #endfor
+    cmd7b="iraf.hedit('%s/r%s//@%s','NCOMBINE','1',veri='no', %s)" % (prefix,pref1,sci_list, std_log)
+    #Causes problem with ds9. CDELT1,2 already set to 0.4"/pix
+    cmd7c="iraf.hedit('%s/r%s//@%s','CD1_1,CD2_2','.',veri='no',delete='yes', %s)" % (prefix,pref1,sci_list, std_log)
+    if do_run: pycmd(cmd7b); pycmd(cmd7c)
+    else: print_log(cmd7b); print_log(cmd7c)
+    
+    if stage == 1:
+        for k in [2,3,4]:
+            if do_run: tzpt, tsig, terr, tnav, save = zpt_info(k)
+            #print len(save), " ...", nfiles
+            for j in range(len(save)):
+                if do_run: #pycmd(cmd1); pycmd(cmd2); pycmd(cmd3)
+                    cmd1a = "iraf.hedit('%s/rss1L%s','MAGZERO%i',val='%f',add='yes',veri='no', %s)" % (prefix,scifile[save[j]], k,tzpt[j], std_log)
+                    cmd1b = "iraf.hedit('%s/rss1L%s','MAGZSIG%i',val='%f',add='yes',veri='no', %s)" % (prefix,scifile[save[j]], k,tsig[j], std_log)
+                    cmd1c = "iraf.hedit('%s/rss1L%s','MAGZERR%i',val='%f',add='yes',veri='no', %s)" % (prefix,scifile[save[j]], k,terr[j], std_log)
+                    cmd1d = "iraf.hedit('%s/rss1L%s','MAGZNAV%i',val='%f',add='yes',veri='no', %s)" % (prefix,scifile[save[j]], k,tnav[j], std_log)
+                    pycmd(cmd1a, scr=0); pycmd(cmd1b, scr=0); pycmd(cmd1c, scr=0); pycmd(cmd1d, scr=0)
+                #else: print_log(cmd1); print_log(cmd2); print_log(cmd3)                                        
+            #endfor
+        #endfor
+    #endif
+#end of reproject_images module
+
+def flatten_images(stage):
+    iraf.nfproc.trim=NO; iraf.nfproc.fixpix=NO; iraf.nfproc.biascor=NO; iraf.nfproc.darkcor=NO
+    if stage == 2: unix_exec('rm -f '+prefix+'/LT_*.fits')
+    if check_for_file(prefix+'/LT_', '.fits') == 'True':
+        print_log('#Apply flat-field (only science frames)'+gettime())
+        if stage == 1:
+            cmd3="iraf.nfproc('@%s','%s/L+',lincor='no',flatcor='yes',flats='%s', %s)" % (sci_list, prefix, flat, std_log)
+        if stage == 2:
+            cmd3="iraf.nfproc('@%s','%s/L+',lincor='no',flatcor='yes',flats='%s', %s)" % (sci_list, prefix, prefix+'/'+prefix+'_Flat.fits', std_log)
+        if do_run: pycmd(cmd3)
+        else: print_log(cmd3)            
+    #endif
+    else: print_log('#Will not run DO_LINFLAT1/2 as file EXISTS'+gettime())
+#end of flatten_images module
+
+def run_skysub(stage):
+    if stage == 1:
+        print_log('#First pass sky-subtraction'+gettime())
+        pref1 = 'ss1L'; stage_cmd = 'DO_SUB1'
+    if stage == 2:
+        print_log('#Second pass sky-subtraction'+gettime())
+        pref1 = 'sssL'; stage_cmd = 'DO_SUB2'
+
+    nosubJ = 0 #set this to 1 to avoid running nfskysub on J-band images in second pass
+    print "NOSUBJ "+str(nosubJ)+". Also doing nfdeltasky"
+    if check_for_file(prefix+'/sss1LT_', '.fits') == 'True':
+        if check_for_file(prefix+'/'+pref1+'T_', '.fits') == 'True':
+            if stage == 1:
+                cmd4="iraf.nfskysub('%s/L//@%s',output='%s/ss1+',skymode='median 5 1',obm='', %s)" % (prefix,sci_list,
+                                                                                                      prefix, std_log)
+            if stage == 2:
+                print_log('#Un-compressing obm2T files ...'+gettime())
+                commands.getstatusoutput('gunzip -f '+prefix+'/obm2T_*.fits.gz')
+                if nosubJ and filt0 == 'J':
+                    cmd4=''
+                    if do_run:
+                        print_log("#Will compute median and subtract off")
+                        for j in range(nfiles):
+                            tempfile = sub2file[j].replace('sss1','sss')
+                            unix_exec('cp '+ltfile[j]+' '+tempfile, 0)
+                            hdulist = pyfits.open(tempfile, mode='update')
+                            for k in dets:
+                                tfile = tempfile+'['+str(k)+']'
+                                mdpt=(iraf.mscstat(tfile,fields="midpt",lower='INDEF',upper='INDEF',nclip=5,lsig=2.5,usig=2.5,format='no',Stderr=1))[0]
+                                hdulist[k].data = hdulist[k].data - float(mdpt)
+                                hdulist[k].header.update('SKYMODE', mdpt, 'mdpt '+time.strftime("%d %b %Y %H:%M:%S", time.localtime()))
+                                print_log("# skysub on "+tempfile+'['+str(k)+'] '+mdpt)
+                            #endfor
+                            hdulist.flush()
+                        #endfor
+                    #endif
+                else:
+                    cmd4="iraf.nfskysub('%s/L//@%s',output='%s/sss+',skymode='median 7 1',obm='%s/obm2//@%s', %s)" % (prefix,sci_list, prefix, #changed to just obm
+                                                                                                                      prefix,sci_list, std_log)
+                #endelse
+            #endif
+            if do_run:
+                if cmd4 != '': pycmd(cmd4)
+                if stage == 1: make_rej_mask(1) #update ss1 files with the BPM keyword
+            else:
+                print cmd4
+                if cmd4 != '': print_log(cmd4)
+        else: print_log('#Will not run '+stage_cmd+' as sssLT file EXISTS'+gettime())
+    else: print_log('#Will not run '+stage_cmd+' as sss1LT file EXISTS'+gettime())
+
+    if stage == 2:
+        if check_for_file(prefix+'/sss1LT_', '.fits') == 'True':
+
+            iraf.nfdeltasky.function='legendre'
+            if nbfilt_flag == 1: iraf.nfdeltasky.xorder=5; iraf.nfdeltasky.yorder=5
+            else: iraf.nfdeltasky.xorder=2; iraf.nfdeltasky.yorder=2 #for broad-band, 2nd order
+            
+            for k in dets:
+                for j in range(nfiles):
+                    if j == 0:
+                        txt = 'SKYSUB2: %s/sssL%s[%i] %s[%i] %s\n' % (prefix,scifile[j],k, obmfile2[j],k, gettime()) #XX obm2T files wont exists
+                        bpm_notes(txt) #make a note of changes.
+                    #endif
+                    cmd = "iraf.hedit('%s/sssL%s[%i]','BPM','%s[%i]',ver='no',show='no')" % (prefix,scifile[j],k, obmfile2[j],k)
+                    exec(cmd)
+                #endfor
+            #endfor
+
+            cmd13b = "iraf.nfdeltasky('%s/sssL//@%s','%s/sss1L//@%s',cross_terms='yes', %s)" % (prefix,sci_list,
+                                                                                                prefix,sci_list, std_log)
+            if do_run:
+                pycmd(cmd13b)
+            else: print_log(cmd13b)
+        
+            if nbfilt_flag == 1: #only do for NB case
+                for j in range(nfiles):
+                    fit_out = scifile[j].replace('T_', prefix+'/sss1fitq4_')
+                    cmd13c="iraf.imarith('%s/sssL%s[4]','-','%s/sss1L%s[4]','%s', %s)" % (prefix,scifile[j],
+                                                                                      prefix,scifile[j], fit_out, std_log)
+                    if do_run: pycmd(cmd13c, scr=0)
+                #endfor
+                cmd13d = "iraf.imcopy('%s/sss1fitq4_*.fits[-*,*]','%s/sss1fitq4_*.fits', %s)" % (prefix, prefix, std_log)
+                cmd13e = "iraf.mscsplit(input='%s/sss1L@%s')" % (prefix, sci_stack) #split sss1L
+                cmd13f = "iraf.imdelete(images='%s/sss1L//@%s', veri='no')" % (prefix, sci_stack) #delete sss1L
+                cmd13g = "iraf.imdelete(images='%s/sss1L*_3.fits', ver='no')" % prefix # delete det#3
+                if do_run: pycmd(cmd13d); pycmd(cmd13e); pycmd(cmd13g); pycmd(cmd13f); 
+                else: print_log(cmd13d); print_log(cmd13e); print_log(cmd13f); print_log(cmd13g)
+                for j in range(nfiles):
+                    fit_in = scifile[j].replace('T_', prefix+'/sss1fitq4_')
+                    cmd13h = "iraf.imarith('%s/sssL%s[3]','-','%s','%s/sss1L%s')" % (prefix, scifile[j], fit_in, prefix,
+                                                                                     scifile[j].replace('.fits','_3.fits'))
+                    cmd13g = "iraf.mscjoin('%s/sss1L%s',verbose='yes', %s)" % (prefix, scifile[j].replace('.fits',''), std_log)
+                    if do_run: pycmd(cmd13h, scr=0); pycmd(cmd13g, scr=0)
+                #endfor
+                if do_run:
+                    iraf.imdelete(images=prefix+'/sss1LT_*_?.fits', veri='no')
+                    iraf.imdelete(images=prefix+'/sss1fitq4_*.fits', veri='no')
+                else:
+                    print_log("iraf.imdelete(images=prefix+'/sss1LT_*_?.fits', veri='no')")
+                    print_log("iraf.imdelete(images=prefix+'/sss1fitq4_*.fits', veri='no')")
+                #endelse
+            #endif
+        else: print_log('#Will not run DO_SUB2 with NFDELTASKY as file EXISTS'+gettime())
+        make_rej_mask(2) #update sss1 files with the BPM keyword
+    #endif
+#end of run_skysub module
+
+def run_bpm(file, keyword, entry):
+    test = iraf.hedit(file+'[1]',keyword,'.', Stderr=1)
+    return string.count(test[0], entry)
+#end run_bpm
+
+if __name__ == "__main__":
+    if len(sys.argv) != 8:
+        print 'usage /scisoft/bin/python run_nfextern.py keyword_flag.txt all_list     field_stack     default_badpix  log  run  delete'
+        print 'e.g.; /scisoft/bin/python run_nfextern.py keyword_flag.txt list.raw.all field_stack.txt nfbpm1.fits     0/1  0/1  0/1'
+        sys.exit()
+    print sys.argv; #print sys.argv[1]
+    NO = "no"; YES = "yes"; dimen = 4; dets = [1,2,3,4]
+    time0 = time.strftime("%d_%b_%Y_%H:%M:%S", time.localtime()); tinit = time.time()
+
+    do_log = int(sys.argv[5]); do_run = int(sys.argv[6]); do_delete = int(sys.argv[7])
+    if do_log: f = file('nfextern_cmds.log.'+time0, 'w', 0)
+    msg_log = 'nfextern_msgs.log.'+time0
+    do_bpmlog = 1
+
+    axis = [1,2,2,1] # changed on 02/12/10 #1,4 are row avg, 2,3 are cols # [2,1,1,2] #1,4 are col avg, 2,3 are row avg
+    rdir = 'raw'; pdir = rdir+'/pmask' #raw dir and pmask dir not in format of list contents
+    if not exists(pdir):
+        print_log("pdir not found. Linking to latent")
+        unix_exec('ln -s '+rdir+'/latent '+pdir)
+    #endif
+    nofile_err = ' NOT FOUND!!!'
+    iraf.set(stdimage="imt4096")
+    iraf.nfextern(_doprint=0); iraf.ace(_doprint=0); iraf.msctools(_doprint=0); iraf.newfirm(_doprint=0)
+
+    keyword_file = sys.argv[1]; all_list = sys.argv[2] #input list
+    field_stack = sys.argv[3]; dbadpix = sys.argv[4]
+
+    std_file = 'err.log.'+time0; std_log = "Stderr='%s'" % std_file
+    if exists(std_file): commands.getstatusoutput('rm -f '+std_log)
+    test = commands.getstatusoutput('cp -f '+keyword_file+' '+keyword_file+'.'+time0)
+    test = commands.getstatusoutput('cp -f '+field_stack+' '+field_stack+'.'+time0)
+    test = commands.getstatusoutput('cp -f '+field_stack+' '+field_stack+'.'+time0)
+    test = commands.getstatusoutput('cp -f /codes/newfirm/run_nfextern.py.v2.0l py.'+time0)
+
+    print_log("#-----------------------------")
+    print_log("#PyRAF NEWFIRM Reduction v2.0L")
+    print_log("#-----------------------------")
+    code_ls = (commands.getstatusoutput('ls -l /codes/newfirm/run_nfextern.py.v*'))[1].split('\n')
+    print_log("#Code timestamps")
+    for tt in range(len(code_ls)): print_log('# '+code_ls[tt])
+
+    print_log('#'+time0.replace('_', ' ')) #commands.getoutput("date"))
+    print_log("#NOTE: This script has ONLY been tested for a subset of NEWFIRM data")
+    print_log("#      Please use at your own risk!!"); print_log("#      Please report any errors/suggestions to:")
+    print_log("#        Chun Ly (chun@astro.ucla.edu)")
+    print_log("#Data monkeys now hard at work ..."); print_log("#  @(^_^)@")
+
+    file_exists = 0
+    if exists(keyword_file):
+        g = open(keyword_file, 'r'); options = g.readlines(); g.close()
+        print_log('#'+keyword_file+' READING IN'+gettime())
+        n_param = len(options); routine_flag = range(n_param); keyword_flag=options
+        for k in range(n_param):
+            file0 = options[k].replace('\n',''); print_log('# '+file0)
+            tmp = file0.split(); routine_flag[k] = int(tmp[2])
+            keyword_flag[k] = tmp[1]
+        #endfor
+        file_exists = 1
+    else: print keyword_file + nofile_err
+
+    print_log("#User needs to symlink to the *msk.fits which contains BPM+CRs+persistence!!!")
+
+    if not exists(all_list): print all_list + nofile_err
+    else: file_exists = file_exists + 1
+
+    if not exists(field_stack): print field_stack + nofile_err
+    else: file_exists = file_exists + 1
+
+    if not exists(dbadpix): print dbadpix + nofile_err
+    else: file_exists = file_exists + 1
+
+    if file_exists != 4: print 'EXITING!!!...'; sys.exit()
+
+    flag_name = ['DO_FP','DO_TRIM','DO_PMASK','DO_LINFLAT1','DO_SUB1','DO_ZPT1',         # 0, 1, 2, 3, 4, 5
+                 'DO_WCS1','DO_PROJ1','DO_COMB1','DO_OBM1','DO_DEPROJ','DO_SKYFLAT',     #  6, 7, 8, 9,10,11
+                 'DO_MP','DO_LINFLAT2','DO_ZPT2','DO_OBM2','DO_SUB2','DO_WCSCOPY',       # 12,13,14,15,16,17 
+                 'DO_PROJ2','DO_COMB2','DO_MANPMASK','DO_REJMASK', 'DO_SINC', 'DO_BIAS2'] # 18,19,20,21,22,23
+
+    flag_val = zeros(len(flag_name), Int)
+    for kk in range(len(flag_name)):
+         for k in range(n_param):
+             if keyword_flag[k].find(flag_name[kk]) != -1: flag_val[kk]=routine_flag[k]
+         #endfor
+    #endfor
+    print flag_val
+    flag_val[21] = 0 #always set this to zero so *_rej.fits file are not created.
+    do_bias2 = flag_val[23]
+    if do_bias2: print_log("##Will do bias removal in both directions"+gettime())
+
+    do_sinc_interp = flag_val[22] #set to zero to use linear interp. for mscimage -- 01/28/10 @1:53P
+    if do_sinc_interp: print_log("#Will do sinc interpolation"+gettime())
+    else: print_log("#Will NOT do sinc interpolation"+gettime())
+
+    #if flag_val[20] == 1:
+    #    check = commands.getstatusoutput('ls raw/pmask/*msk.fits')
+    #    if check[0] != 0:
+    #        print_log("#User's PMASK files not found!!"); print_log("#Defaulting to NFMASK!!")
+    #        flag_val[20] = 0; flag_val[2] = 1; print_log("#flag_val[2] = 1")
+    #    #endif
+    #    if flag_val[2] == 1: #Either MANPMASK or DO_PMASK
+    #        print_log("#DO_MANPMASK and DO_PMASK both set. Choosing the former"+gettime())
+    #        flag_val[2] = 0
+    #    #endif
+    ##endif
+
+    field_loop = asciidata.open(field_stack) # read in field_stack file
+    prefix0 = field_loop[0]; flat0 = field_loop[3]; badpix0 = field_loop[4]
+    sci_list0 = field_loop[1]; sci_stack0 = field_loop[2]; ref_im0 = field_loop[5]; sigma_limit0 = field_loop[6]
+    print_log("# Fields to be reduced are: ")
+    for i in range(len(prefix0)): print_log("# "+prefix0[i])
+
+    zpt_keywords = ['MCATALOG','MAGZERO1','MAGZSIG1','MAGZERO','MAGZSIG','MAGZERR', #NFWCS keywords for DO_WCSCOPY
+                    'MAGZNAV','MAGZERR1','MAGZNAV1','FWHM','FWHM0','WEIGHT','SKY'] 
+    nb_filter=['F2096N', 'F1187N', '1190', 'F2124N']
+
+    #BEGINNING OF FIRST-PASS
+    if flag_val[0]: #DO_FP = 1
+        print_log(' '); print_log('#Beginning first-pass reduction with NFOPROC'+gettime())
+        if flag_val[1]: #DO_TRIM == 1   ###trim all images in sequence including non-science frames and linearize
+            if check_for_file('T_', '.fits | grep -v rejmsk') == 'True':
+                print_log('#Trimming and linearizing images'+gettime())
+                iraf.nfoproc.fixpix=NO; iraf.nfoproc.biascor=NO; iraf.nfoproc.darkcor=NO; iraf.nfoproc.bpm=dbadpix
+                cmd1a="iraf.nfoproc('%s///@%s',output='T_+',trim='yes',lincor='yes',flatcor='no', %s)" % (rdir,all_list,std_log)
+                if do_run: pycmd(cmd1a)
+                else: print_log(cmd1a)
+            
+                for k in dets: ### set BPM in header. Loop over detectors
+                    if run_bpm(scifile[0], 'BPM', dbadpix) == 1:
+                        cmd1b = "iraf.hedit('T_*.fits[%i]','BPM','%s[im%i]',verify='no', %s)" % (k,dbadpix, k, std_log)
+                        if do_run: pycmd(cmd1b)
+                        else: print_log(cmd1b)
+                    else: print '### BPM values are updated correctly'
+                #endfor
+            else:
+                print_log('#Will not run DO_TRIM as file EXISTS'+gettime())
+                print_log("#User masking and header updates done. Ignoring"+gettime())
+
+        if flag_val[20]:
+            print_log('#Updating FITS headers to use persistence masks develop by the user(s)'+gettime())
+            print_log('#Note: These images must be trimmed to 2046x2046 and have been process into the PLIO format')
+            print_log('#The file convention is raw/pmask/filename_msk.fits')
+            for k in dets:
+                f1 = open(all_list, 'r'); files0 = f1.readlines(); f1.close()
+                ghead0 = commands.getstatusoutput('gethead -f -x 1 MASK T*.fits')
+                if ghead0[1] == '':
+                    cmd2a='iraf.hedit("T_//@%s//\[%i]","PROCDONE","(procdone // \',Z\')",veri="no",Stderr="%s")' % (all_list,k, std_file)
+                    if do_run: pycmd(cmd2a)
+                    else: print_log(cmd2a)
+
+                    for j in range(len(files0)):
+                        scifile = 'T_'+files0[j].replace('\n',''); maskfile = pdir+'/'+scifile.replace('.fits','_msk.fits').replace('T_','')
+                        #temp = (iraf.hedit(scifile+"[1]", fields="PROCDONE", ".", Stderr=1))[0]
+                        #if temp.rfind('Z') == -1: # checks to see if step was performed
+                        cmd2b="iraf.hedit('%s[%i]','MASK','%s[im%i]',veri='no',add='yes', %s)" % (scifile,k, maskfile,k, std_log)
+                        if do_run: pycmd(cmd2b, scr=0)
+                    #endfor
+                #endif
+            else: print_log("#User masking and header updates done. Ignoring "+gettime())
+
+        if flag_val[2]: #DO_PMASK == 1
+            print_log('#Make saturation and persistence masks with NFMASK'+gettime())
+            if check_for_file('*', '_msk.fits') == 'True':
+                mask_list = 'list1.tmp'
+                if exists(mask_list): unix_exec('rm -f '+mask_list)
+                unix_exec('ls -1 T_*.fits > '+mask_list)
+                iraf.nfmask.sat1=1e4; iraf.nfmask.sat2=1e4; iraf.nfmask.sat3=1e4; iraf.nfmask.sat4=1e4
+                iraf.nfmask.bpmval=1; iraf.nfmask.obmval=1; iraf.nfmask.satval=1; iraf.nfmask.perval=1
+                iraf.nfmask.perwind=8; iraf.nfmask.perthre=0.7
+                cmd2 = "iraf.nfmask('input=%s//@%s',output='+_msk',scoeffs='parameter',bpm='%s', %s)" % (mask_list,dbadpix, std_log) #something is wrong with this line
+                if do_run: pycmd(cmd2)
+                else: print_log(cmd2)
+            else: print_log('#Will not run DO_PMASK as file EXISTS'+gettime())
+
+        for i in range(field_loop.nrows): #loop over each field stacks
+            prefix = prefix0[i].strip().replace('.', '\.'); stack_pref = prefix+'_Stack1'; flat=flat0[i].strip()
+            sci_list = sci_list0[i].strip(); sci_stack = sci_stack0[i].strip(); badpix = badpix0[i].strip(); ref_im = ref_im0[i].strip()
+            sigma_limit = sigma_limit0[i]; print "SIGMA", sigma_limit
+            print_log(' ');
+            str0 = '#prefix=%s stack_pref=%s sci_list=%s sci_stack=%s' % (prefix,stack_pref, sci_list,sci_stack); print_log(str0)
+            str0 = '#flat=%s badpix=%s ref_im=%s' % (flat, badpix, ref_im); print_log(str0)
+
+            if do_bpmlog: bpml = create_bpmlog()
+
+            check_field_files(sci_list, sci_stack, flat, ref_im)
+            if not exists(badpix): print badpix + nofile_err
+            if exists(sci_list) and exists(sci_stack) and exists(flat) and exists(badpix) and exists(ref_im):
+                print_log('### Working on Stack: '+prefix+gettime())
+                if not exists(prefix): commands.getstatusoutput('mkdir '+prefix) # make directory
+                radec = commands.getstatusoutput('gethead CRVAL1 CRVAL2 '+ref_im)
+                field_ra = float((radec[1].split())[0]); field_dec = float((radec[1].split())[1])
+
+                nbfilt_flag,nfiles,filt0,scifile,rawfile,maskfile,rejfile,obmfile,obmfile2,subfile,sub2file,ltfile = list_define(sci_list)
+
+                if flag_val[21]: make_rej_mask(0)
+
+                for k in dets: ### set BPM keyword in header
+                    commands.getstatusoutput("awk '{print $0 \"[im"+str(k)+"]\"}' < "+sci_list+" > test.lis")
+                    txt = 'Init values: %s[im%i] %s[im%i] %s\n' % (sci_list, k, badpix, k, gettime())
+                    bpm_notes(txt) #make a note of changes.
+                    cmd0 = "iraf.hedit('@test.lis', 'BPM', '%s[im%i]', verify='no', %s)" % (badpix, k, std_log)
+                    if do_run: pycmd(cmd0)
+                    else: print_log(cmd0)
+                if exists('test.lis'): commands.getstatusoutput('rm -f test.lis')
+
+                if flag_val[3]: flatten_images(1) #DO_LINFLAT1 == 1
+                    
+
+                if flag_val[5]: #DO_ZPT1 == 1
+                    if do_run: det_norm(ltfile, filt0)
+                    else: print_log('det_norm(ltfile, '+filt0+')')
+
+                if flag_val[4]: run_skysub(1) #DO_SUB1 == 1
+
+                if flag_val[6]: #DO_WCS1 == 1
+                    ghead0 = commands.getstatusoutput('gethead -f -x 1 MAGZERO '+prefix+'/ss1L*.fits')
+                    if ghead0[1] == '': run_nfwcs('ss1L')
+                    else: print_log('#Will not run DO_WCS1 as calibration was completed'+gettime())
+
+                    if do_run: wcs_zpt_weight(1) #always runs. Applies to ss1LT files
+                    else: print_log('#wcs_zpt_weight(1)')
+                
+                if flag_val[7]: reproject_images(1) #DO_PROJ1 == 1
+                       
+                if flag_val[8]: run_combine(1) #DO_COMB1 == 1
+                
+                if flag_val[9]: #DO_OBM1 == 1
+                    if check_for_file(prefix+'/'+stack_pref+'_obm', '.fits') == 'True':
+                        print_log('#Make object mask from stack'+gettime())
+                        iraf.acesegment.hsigma=3.0; print "HSIGMA", iraf.acesegment.hsigma
+                        iraf.acesegment.ngrow=7; iraf.acesegment.agrow=3
+                        cmd9a = "iraf.acesegment('%s/%s.fits',exps='%s/%s_exp.pl',%s)" % (prefix,stack_pref, prefix,stack_pref, std_log)
+                        ucmd1 = 'mv -f %s*.fits %s' % (stack_pref, prefix) #move to prefix dir
+                        ucmd2 = 'cp -f %s/%s_obm.fits %s/%s_obm1000.fits' % (prefix, stack_pref, prefix, stack_pref)
+                        cmd9b = "iraf.imreplace('%s/%s_obm1000.fits[pl]',val=1000,low=1,up='INDEF', %s)" % (prefix,stack_pref, std_log)
+                        if do_run: pycmd(cmd9a); unix_exec(ucmd1); unix_exec(ucmd2); pycmd(cmd9b)
+                        else: print_log(cmd9a); print_log(ucmd1); print_log(ucmd2); print_log(cmd9b)
+                    else: print_log('#Will not run DO_OBM1 as file EXISTS'+gettime())
+
+                if flag_val[10]: #DO_DEPROJ == 1
+                    #if check_for_file(prefix+'/obm2T_', '.fits') == 'True':
+                    #else: print_log('#Will not run DO_DEPROJ as file EXISTS'+gettime())
+                    print_log('#Deproject the object mask'+gettime())
+                    for j in range(nfiles):
+                        if not exists(prefix+'/obm'+scifile[j]):
+                            if flag_val[20]: trejfile = rejfile[j]
+                            else: trejfile = maskfile[j]
+                            if do_run: iraf.imcopy(prefix+'/ss1L'+scifile[j]+'[0]', prefix+'/obm'+scifile[j]+'[0]', verbose=NO) #xxx
+                            for k in dets:
+                                rawfile_ext = scifile[j].replace('.fits','_'+str(k)+'.fits') #T_raw*_?.fits
+                                cmda = "iraf.mscimage('%s/%s_obm1000.fits[pl]','%s/obm%s',refer='%s/ss1L%s[%i]', " % (prefix,stack_pref, #xxxx
+                                                                                                                      prefix, rawfile_ext,
+                                                                                                                      prefix,scifile[j],k)
+                                cmdb = "format='image', pixmask='no', wcssour='match', boundar='constant', fluxcon='no', %s)" % std_log
+                                cmdc = "iraf.imcopy('%s/obm%s','%s/obm%s[im%i,append]', %s)" % (prefix, rawfile_ext,
+                                                                                                prefix,scifile[j],k, std_log)
+                                cmdd = "iraf.imdel(images='%s/obm%s', verify='no')" % (prefix, rawfile_ext)
+                                if do_run:
+                                    iraf.sleep(1.0); iraf.flpr()
+                                    pycmd(cmda+cmdb, scr=0); pycmd(cmdc, scr=0); pycmd(cmdd, scr=0)
+                                else: print_log(cmda+cmdb, scr=0); print_log(cmdc, scr=0); print_log(cmdd, scr=0)
+                            #endfor
+                            #cmd4e = "iraf.mscarith('%s/obm%s','+','%s','%s/obm2%s',pixtype='short')" % (prefix,scifile[j],
+                            #                                                                            trejfile, prefix,scifile[j])
+                            #if do_run: pycmd(cmd4e, scr=0)
+                            #else: print_log(cmd4e, scr=0)
+                        else: print_log('#File exists: '+prefix+'/obm'+scifile[j])
+                    #endfor
+
+                if flag_val[11]: #DO_SKYFLAT == 1
+                    if check_for_file(prefix+'/*Flat', '.fits') == 'True':
+                        if nbfilt_flag == 0:
+                            print_log('#Producing skyflat'+gettime())
+                            iraf.imcombine.combine='average'; iraf.imcombine.reject='avsigclip'; iraf.imcombine.offsets='none'
+                            iraf.imcombine.masktyp='goodval'; iraf.imcombine.maskval=0; iraf.imcombine.blank=0.;
+                            iraf.imcombine.scale='median'; iraf.imcombine.zero='none'; iraf.imcombine.weight='none';
+                            iraf.imcombine.lthresh=0; iraf.imcombine.hthresh='INDEF'
+                            iraf.imcombine.mclip=YES; iraf.imcombine.lsig=3; iraf.imcombine.hsig=3
+                            iraf.imcopy(input=flat+'[0]', output=prefix+'/'+prefix+'_Flat.fits')
+                            #commands.getstatusoutput('cp -f '+flat+' '+prefix+'/Flat.fits')
+                            for k in dets:
+                                awkcmd1 = "awk '{print $0 \"[im%i]\"}' < %s > list.tmp" % (k, sci_list)
+                                if do_run:
+                                    flat_ext = prefix+'/'+prefix+'_Flat_%i.fits' % k
+                                    for j in range(nfiles):
+                                        if j == 0:
+                                            txt = 'DO_SKYFLAT: %s[im%i] %s[im%i] %s\n' % (scifile[j],k, obmfile[j],k, gettime()) #XX obm2T files wont exists
+                                            bpm_notes(txt) #make a note of changes.
+                                        #endif
+                                        cmd = "iraf.hedit('%s[%i]','BPM','%s[im%i]',ver='no',show='no')" % (scifile[j],k, obmfile[j],k) ##XX obm2T files wont exists
+                                        exec(cmd)
+                                    #endfor
+                                    cmd12 = "iraf.imcombine('@list.tmp', '%s', %s)" % (flat_ext, std_log)
+                                    unix_exec(awkcmd1); pycmd(cmd12)
+                                    iraf.fixpix(images=flat_ext, masks=badpix+'['+str(k)+']')
+
+                                    sig_mdpt = (iraf.imstat(flat_ext,fields="stddev,midpt",lower='INDEF',upper='INDEF',nclip=5,
+                                                            lsig=2.5,usig=2.5,format='no', Stderr=1))[0]
+                                    sigma = float((sig_mdpt.split())[0]); mdpt = float((sig_mdpt.split())[1])
+                                    print_log("#%s sigma=%5.1f midpt=%5.1f" % (flat_ext, sigma, mdpt))
+                                    iraf.imarith(operand1=flat_ext, op="/", operand2=mdpt, result=flat_ext)
+                                    iraf.imcopy(input=flat_ext, output=prefix+'/'+prefix+'_Flat.fits[append]')
+                                    iraf.imdel(prefix+'/'+prefix+'_Flat_?.fits', ver='no') # delete *Flat_?.fits
+                                    for j in range(nfiles):
+                                        if j == 0:
+                                            txt = 'DO_SKYFLAT: %s/L%s[%i] %s[%i] %s\n' % (prefix,scifile[j],k, badpix,k, gettime())
+                                            bpm_notes(txt) #make a note of changes.
+                                        #endif
+                                        cmd = "iraf.hedit('%s/L%s[%i]','BPM','%s[%i]',ver='no',show='no')" % (prefix,scifile[j],k, badpix,k)
+                                        exec(cmd)
+                                    #endfor
+                                else: print_log(awkcmd1); #print_log(cmd12)
+                            #endfor
+                        else: print_log('#Will not run DO_SKYFLAT as NOT a broad-band filter'+gettime())
+                    else: print_log('#Will not run DO_SKYFLAT as file EXISTS'+gettime())                    
+                #endif
+            #endif
+            if do_bpmlog: bpml.close()
+        #endfor
+    #endif
+
+    #BEGINNING OF MASK-PASS
+    if flag_val[12]: #DO_MP == 1
+        print_log(' '); print_log('#Beginning second-pass reduction'+gettime())
+        for i in range(field_loop.nrows): #loop over each field stacks
+            prefix = prefix0[i].strip(); stack_pref = prefix+'_Stack1'; stack_pref2 = prefix+'_Stack2'; flat=flat0[i].strip()
+            sci_list=sci_list0[i].strip(); sci_stack=sci_stack0[i].strip(); badpix=badpix0[i].strip(); ref_im=ref_im0[i].strip()
+            sigma_limit = sigma_limit0[i]; print "SIGMA", sigma_limit
+            str0 = '#prefix=%s stack_pref=%s stack_pref2=%s sci_list=%s sci_stack=%s' % (prefix, stack_pref, stack_pref2,
+                                                                                         sci_list,sci_stack)
+            print_log(' '); print_log(str0)
+            str0 = '#flat=%s badpix=%s ref_im=%s' % (flat, badpix, ref_im); print_log(str0)
+            
+            if do_bpmlog: bpml = create_bpmlog()
+
+            check_field_files(sci_list, sci_stack, flat, ref_im)
+            if exists(sci_list) and exists(sci_stack) and exists(flat) and exists(ref_im):
+                print_log('### Working on Stack: '+prefix+gettime())
+                if not exists(prefix): commands.getstatusoutput('mkdir '+prefix)
+                radec = commands.getstatusoutput('gethead CRVAL1 CRVAL2 '+ref_im)
+                field_ra = float((radec[1].split())[0]); field_dec = float((radec[1].split())[1])
+
+                nbfilt_flag,nfiles,filt0,scifile,rawfile,maskfile,rejfile,obmfile,obmfile2,subfile,sub2file,ltfile = list_define(sci_list)
+                #print rejfile
+                if flag_val[21]: make_rej_mask(0) #generate rej.fits file. BPM + pmask's _msk.fits. OBSOLETE 
+
+                if nbfilt_flag == 0:
+                    if flag_val[13]: flatten_images(2) #DO_LINFLAT2 = 1
+
+                    print_log("# LT files"+str(len(ltfile)))
+                    if flag_val[14]: #DO_ZPT2 == 1
+                        if do_run: det_norm(ltfile, filt0)
+                        else: print_log('#det_norm(ltfile, '+filt0+')')
+                    #endif
+                else: print_log("#Using standard input FLAT instead as new flat is not generated"+gettime())
+
+                if flag_val[15]: #DO_OBM2 == 1
+                    if check_for_file(prefix+'/obm2T', '.fits.gz') == 'False':
+                        print_log("#gunzipping obm2T files"+gettime())
+                        commands.getstatusoutput('gunzip -f '+prefix+'/obm2T_*.fits.gz')
+                    #endif
+                    if check_for_file(prefix+'/obm2T', '.fits') == 'True':
+                        if check_for_file(prefix+'/obmT', '.fits.gz') == 'False':
+                            print_log("#gunzipping obmT files"+gettime())
+                            commands.getstatusoutput('gunzip -f '+prefix+'/obmT_*.fits.gz')
+                        #endif
+                        make_obm2T_files()
+                        #print_log('#Compressing obmT* files ...'+gettime()) ## XX this should be moved to a later stage
+                        #commands.getstatusoutput('gzip -f '+prefix+'/obmT_*.fits') ## XX this should be moved to a later stage
+                    else: print_log('#Will not run DO_OBM2 as file EXISTS'+gettime())
+                #endif
+
+                if flag_val[16]: #DO_SUB2 == 1
+                    run_skysub(2) # for NB, obm2T is used
+
+                    print_log('#Compressing obm2T files ...'+gettime())
+                    commands.getstatusoutput('gzip -f '+prefix+'/obm2T_*.fits')
+
+                    if do_run: median_filter(sub2file, obmfile2)
+                #endif
+
+                if flag_val[17]: #DO_WCSCOPY == 1
+                    print_log('#Copy or run nfwcs to get WCS info'+gettime())
+                    test = commands.getstatusoutput('ls -1 '+prefix+'/wcsLT*.fits')
+                    if test[0] == 0: print_log('#Copy the WCS from the wcs image'+gettime())
+                    else:
+                        #ghead0 = commands.getstatusoutput('gethead -f -x 1 MAGZERO '+prefix+'/sss1L*.fits')
+                        run_nfwcs('sss1L') #if ghead0[1] == '': run_nfwcs('sss1L')
+                        #else: print_log('#Will not run DO_WCS1 as calibration was completed'+gettime())
+                    #endelse
+                    if do_run: wcs_zpt_weight(2) #update sss1LT files
+                    #update_weight(prefix, scifile, 'sss1') #obsolete as wcs_zpt_weight runs update_weight
+
+                if flag_val[18]:
+                    make_rej_mask(2) #make sure sss1LT images have BPM set to *rej.fits
+                    reproject_images(2) #DO_PROJ2 == 1
+
+                if flag_val[19]: run_combine(2) #DO_COMB2 == 1
+            #endif
+            if do_bpmlog: bpml.close()
+        #endfor
+    #endif
+    msg = '#run_nfextern.py completed at %s // %s minutes' % (gettime(), (time.time() - tinit)/60.0); print_log(msg)
+    if do_log: f.close()
+#endif
+
+#def exp_norm(prefix, scifile):
+#    etime = run_gethead('EXPTIME', prefix, 'LT*.fits')
+#    fsample = run_gethead('FSAMPLE', prefix, 'LT*.fits')
+#    ghead0 = commands.getstatusoutput('gethead -f -x 1 DETIME '+prefix+'/L*.fits')
+#    if ghead0[1] == '':
+#        #if len(sets.Set(etime)) != 1:
+#        #    print_log('#Exptime different. Scaling by EXPTIME first. LT files will be in ADU/s'+gettime())
+#        for j in range(nfiles): 
+#            cmd4a = "iraf.mscarith(operand1='%s/L%s',op='/',operand2=%i,result='%s/L%s', %s)" % (prefix,scifile[j],
+#                                                                                                 etime[j]*fsample[j],
+#                                                                                                 prefix,scifile[j], std_log)
+#            if do_run:
+#                pycmd(cmd4a, scr=0)
+#                #else: pycmd(cmd4a, scr=0)
+#                for k in dets:
+#                    cmd4ab= "iraf.hedit('%s/L%s[im%i]','DETIME', 1.0,add='yes',veri='no', %s)" % (prefix,scifile[j],k, std_log)
+#                    pycmd(cmd4ab, scr=0)
+#                    #else: pycmd(cmd4ab, scr=0)
+#                #endfor
+#            else: print_log(cmd4a, scr=0)
+#        #endfor
+#        #else: print_log('#Exptime is the same. '+gettime())
+#    else: print_log('#Images are scaled by exptime'+gettime())
+##end of exp_norm module
+
+#*** Currently not in use anymore
+#def mask_badcolrow(file_list, mask_list, rejfile_list):
+#    width = 6
+#    for i in range(len(file_list)):
+#        if exists('test.fits'): commands.getstatusoutput('rm -f test.fits')
+#        if exists('test2.fits'): commands.getstatusoutput('rm -f test2.fits')
+#        for j in dets:
+#            im0 = numpy.zeros((2046,2046), dtype=float)
+#            if j != 0: #== 3: #only consider det#3
+#                hdr = pyfits.getheader(rejfile_list[i], j)
+#                if len(iraf.hedit(rejfile_list[i]+'['+str(j)+']','DO_MASK2','.', Stderr=1)) == 0:
+#                    hdr.update('DO_MASK2', 1, 'Added'+gettime())
+#                    im = pyfits.getdata(file_list[i], j)
+#                    mask_im = pyfits.getdata(mask_list[i], j)
+#                    mask_im[numarray.nonzero(mask_im)] = numpy.nan #replace mask region with NaN's
+#                    ymed0 = numpy.zeros(2046, dtype=float) #; yavg0 = numpy.zeros(2046)
+#                    for ll in range(int(2046/width)):
+#                        oned=im[range(ll*width,(ll+1)*width),:]
+#                        mark=oned[numpy.isfinite(mask_im[range(ll*width,(ll+1)*width),:])]
+#                        mark = clip_median(mark)
+#                        ymed0[range(ll*width,(ll+1)*width)] = numpy.median(mark)
+#                        im0[range(ll*width,(ll+1)*width),:] = numpy.median(mark) #replace with median val
+#                    #endfor
+#                    ysig0 = numpy.std(ymed0); yavg0 = numpy.median(ymed0) #xsig0 = numpy.std(xmed0); xavg0 = numpy.median(xmed0)
+#                    im0 = (numpy.abs(im0 - yavg0))/ysig0
+#                    #marky = numpy.where( ymed0 - yavg0 > 0.5*ysig0); im0[marky,:] = 1 # mask val is 1
+#                    good = numpy.where(im0 == 1)
+#                    if numpy.size(good)/2 > 0.05*(2046.0*2046.0):
+#                        im0 = 0
+#                    #endif
+#                else: print '#mask_badcolrow completed on '+rejfile_list[i]
+#            #endif
+#            if j == 1: pyfits.writeto('test.fits', im0)
+#            else: pyfits.append('test.fits', im0)
+#        #endfor
+#        #cmd4a = "iraf.mscarith(operand1='%s', op='+', operand2='test.fits', result='test2.fits', pixtype='short')" % (rejfile_list[i])
+#        #exec(cmd4a)
+#        #if exists(rejfile_list[i]): test=commands.getstatusoutput('rm -f '+rejfile_list[i])
+#        #iraf.imcopy(input='test2.fits[0]', output=rejfile_list[i], verbose='no')
+#        #for j in dets:
+#        #    cmd4b = "iraf.imcopy(input='test2.fits[%i]', output='%s[type=mask,append,inherit]', verb='no')" % (j, rejfile_list[i]); exec(cmd4b)
+#    #endfor
+##end of mask_badcolrow module
+
+## Change to use make_obm2T_files():
+#for j in range(nfiles):
+#    if not exists(prefix+'/obm2'+scifile[j]):
+#        if flag_val[20]: trejfile = rejfile[j]
+#        else: trejfile = maskfile[j]
+#        cmd4e = "iraf.mscarith('%s/obm%s','+','%s','%s/obm2%s',pixtype='short')" % (prefix,scifile[j],
+#                                                                                    trejfile, prefix,scifile[j])
+#        if do_run: pycmd(cmd4e, scr=0)
+#        else: print_log(cmd4e, scr=0)
+#    else: print_log('#File exists: '+prefix+'/obm2'+scifile[j])
+##endfor
+
+## placed as part of do_wcscopy, but not not deleting them
+#cmd7d = "iraf.imdelete('%s/ss1L//@%s', veri='no')" % (prefix, sci_list)
+#if do_run: pycmd(cmd7d)
+#else: print_log(cmd7d)
+
+#these files don't benefit from compressing it.
+#if do_delete: 
+#    print_log('#Compressing T* files ...'+gettime())
+#    commands.getstatusoutput('gzip -f T_*.fits')
+
+## was part of median_filter but I removed it. This is using a more brute force technique
+#    else:
+#        print_log("#Using IRAF/fit1d approach")
+#        for j in range(len(file_list)):
+#            ##scifile = files0[j].replace('\n','')
+#            iraf.imcopy(input=file_list[j]+'[0]', output=prefix+'/bias_temp.fits[0,append]', verbose='no')
+#            #iraf.hedit(prefix+'/bias_temp.fits', 'BITPIX', 32, show='no', update='yes', add='no')
+#            for k in dets:
+#                ##scifile_ext = scifile.replace('.fits', '_'+str(k)+'.fits')
+#                cmd12b="iraf.fit1d('%s[im%i]','%s/bias_temp.fits[im%i,append,inherit]',axis=%i,type='difference')" % (file_list[j],k,
+#                                                                                                                      prefix,k, axis[k-1])
+#                #cmd12c = "iraf.imcopy('%s/sss1L%s', output='%s/sss1L%s[im%i,append,inherit]', verbose='no')" % (prefix,scifile_ext, prefix, scifile, k)
+#                pycmd(cmd12b, scr=0); #pycmd(cmd12d); #pycmd(cmd12c); 
+#            #endfor
+#            unix_exec('mv '+prefix+'/bias_temp.fits '+file_list[j], scr=0)
+#            #cmd12d = "iraf.imrename('%s/bias_temp.fits', '%s', verbose='no')" % (prefix, file_list[j])
+#            #pycmd(cmd12d)
+#            for k in dets: iraf.hedit(file_list[j]+'[im'+str(k)+']', 'DO_BIAS',1, add='YES',show='no',update='yes')
+#        #blah = commands.getstatusoutput('rm -f '+prefix+'/sssL'+scifile)
+#        #for k in dets:
+#        #    biasdata = numpy.array([pyfits.getdata('%s/sssL%s' % (prefix, frames), k) for frames in fnames[0]])
+#        #    bias = numpy.median(biasdata); pyfits.writeto(prefix+"/bias_"+str(k)+".fits",bias)
+#        #endfor
+#    #endelse
+
+#obsolete for wcs_copy
+#    if do_run: #Copy NFWCS headers from FP to MP
+#        cmd_ghead = 'gethead -x '+str(k)+' '+' '.join(zpt_keywords)+' '+prefix+'/ss1L*.fits > ghead.dat'
+#        ghead0=commands.getstatusoutput(cmd_ghead)
+#        f4 = open('ghead.dat', 'r'); gdata = f4.readlines(); f4.close()
+#        for j in range(len(gdata)):
+#            gsplit = gdata[j].replace('\n','').split(' '); gsplit[0] = gsplit[0].replace('ss1', 'sss1')+'[im'+str(k)+']'
+#            for l in range(len(zpt_keywords)):
+#                iraf.hedit(prefix+'/'+gsplit[0], zpt_keywords[l], gsplit[l+1], add=YES,ver=NO,show=NO)
+#            #endfor
+#        #endfor
+#    #endif
+
+#obsolete as using an blank image to avoid additional interpolation
+#        iraf.wregister.interpolant='linear' #'sinc'
+#        cmd16b="iraf.wregister('%s/%s.fits','%s','%s/%s_mosaic_sci.fits', %s)" % (prefix,stack_pref0,
+#                                                                                  ref_im, prefix,prefix, std_log)
+#        cmd16c="iraf.wregister('%s/%s_exp.pl','%s','%s/%s_mosaic_exp.fits', %s)" % (prefix,stack_pref0,
+#                                                                                    ref_im, prefix,prefix, std_log)
+#            
+#    if do_run:
+#        pycmd(cmd16b); pycmd(cmd16c)

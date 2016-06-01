@@ -1,0 +1,5 @@
+#!/bin/csh
+cd $1
+cat $2_*_setup_q3.cl > 00setup_$2_q3.cl
+cat $2_*_reduce_q3.cl > 00reduce_$2_q3.cl
+cd ..

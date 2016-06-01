@@ -1,0 +1,324 @@
+#!/usr/bin/env python
+# $Id$
+import os
+import sys
+import shutil
+import string
+from math import *
+from numarray import *
+import string
+
+# extra comment
+
+verbose = 1
+o = os.system
+
+dbadpix = 'calib/badpix/'
+ddark = 'calib/dark/'
+dflat = 'calib/flat/'
+draw = 'raw'
+##### ---> PVD
+dref = 'calib/refimage/'
+##### <--- PVD
+log = '00NIGHT_LOG.cat'
+fields = 'setup/00FIELDS.cat'
+
+radeg=180/pi
+distance_lim=0.2 # if pointing within 1 degree, assume we are on the right field
+
+#if not os.access('login.cl',os.F_OK):
+#   print('NOTE: no login.cl found. Please provide a login.cl in the present working directory.')
+#   sys.exit()
+
+if not os.access(fields,os.F_OK):
+   print('NOTE: no fields file found, please provide a file ',fields,' containing 3 columns: fieldname, ra, dec')
+   sys.exit()
+
+#else:
+#  set     uparm           = "home$uparm1/"
+# find out working uparm, duplicate multiple times to # of cores 
+
+# --------------------------------------- begin class cat 
+class cat:
+  """Simple catalog class.""" 
+
+  def __init__(self,catfile=None):
+    if catfile is None:
+      self.data = []
+      self.hdr = []
+      self.datatype=[]
+    else: 
+      self.load(catfile)  
+
+  # load catalog, give filename
+  def load(self,catfile):
+    f = open(catfile)
+    lines = f.readlines()
+    f.close()
+    self.hdr = string.split(lines[0].lower().replace('#',''))
+    self.data = []
+    for line in lines[1:]: 
+      self.data.append(string.split(line))
+
+  # save catalog, give filename
+  def save(self,catfile):
+    f = open(catfile,'w')
+    f.write('# '+string.join(self.hdr,' ')+'\n')
+    for row in self.data: 
+      for field in row:
+        f.write(str(field)+' ')
+      f.write('\n')  
+    f.close()
+
+  # select columns given list of header keywords
+  def col(self,keylis):
+    """Select columns keylis from catalog"""
+    
+    keylis = keylis.lower().split()
+
+    ikeys=[]
+    for key in keylis:
+      ikeys.append(self.hdr.index(key))
+    cols=[]
+
+    # in each row, select one or more columns
+    for row in self.data:
+      c=[]
+      for i in ikeys:
+        try: # if cannot eval to float or int, use string
+           c.append(eval(row[i]))
+        except (SyntaxError,TypeError,NameError):
+           c.append(row[i]) 
+
+      # if only one key, write plain list i.s.o. nested  
+      if len(ikeys) == 1: 
+        cols.append(c[0])
+      else:
+        cols.append(c)
+
+    return cols
+
+  def sel(self,expr):
+    """Select rows in catalog that satisfy expr."""
+
+    # expand columns corresponding to header keywords to named numarrays 
+    # can only do for floats,ints  
+    s = expr.split()
+    for element in s:
+      try:    
+        var = self.hdr[self.hdr.index(element)]
+        exec(compile(var+'='+'array(self.col("'+var+'"))','<string>','exec'))             
+      except ValueError: 
+        pass
+    
+    # evaluate selection expression: keep lines for which expr is true
+    # @@ Compound expressions dont work. dont know why
+    exec(compile('result=where('+expr+',1,0)','<string>','exec'))                    
+    newdata=[]
+    for i in range(len(self.data)):
+      if result[i]:
+        newdata.append(self.data[i])
+    self.data=newdata
+    return self
+# --------------------------------------- end class cat 
+
+
+ 
+# from skyangles to degrees
+def todeg(angle):
+  a = angle.split(':')
+  return int(a[0])+int(a[1])/60.+float(a[2])/3600. 
+
+def write_prepscript(outfile,refimage,filt,ncoadd,expcoadd):
+    dark = ddark+'dark_'+str(ncoadd)+'x'+str(expcoadd)+'s'
+    flat = dflat+'flat_'+filt
+# ADD
+#--> iraf.imcalc.pixtype="real"
+#--> iraf.imcalc.equals="(im1-im2)/im3"
+    print "using ", dark, flat
+    # write the prep file
+    f=open(outfile+'.prep','w')
+    f.write("echo 'imdel "+outfile+"/q*.fits ' > "+outfile+"_setup.cl \n")
+#    f.write("echo imcalc.equals=\"\'(im1-im2)/im3\'\" >> "+outfile+"_setup_q3.cl \n")
+    f.write("echo imcalc.pixtype=\"\'real\'\" >> "+outfile+"_setup.cl \n")
+    f.write("cat "+outfile+"/raw.lis | awk '{print a,d$1b dd b ff b, e c$1,f}' a=imcalc dd=,"+dark+" ff=,"+flat+" b=[1] c=q1_ d=raw/ e="+outfile+"/ f=\"\'(im1-im2)/im3\'\" >> "+outfile+"_setup.cl \n")
+    f.write("cat "+outfile+"/raw.lis | awk '{print a,d$1b dd b ff b, e c$1,f}' a=imcalc dd=,"+dark+" ff=,"+flat+" b=[2] c=q2_ d=raw/ e="+outfile+"/ f=\"\'(im1-im2)/im3\'\" >> "+outfile+"_setup.cl \n")
+    f.write("cat "+outfile+"/raw.lis | awk '{print a,d$1b dd b ff b, e c$1,f}' a=imcalc dd=,"+dark+" ff=,"+flat+" b=[3] c=q3_ d=raw/ e="+outfile+"/ f=\"\'(im1-im2)/im3\'\" >> "+outfile+"_setup.cl \n")
+    #### PVD --->
+    f.write("echo 'imdel "+outfile+"/q3*.fits ' > "+outfile+"_setup_q3.cl \n")
+#    f.write("echo imcalc.equals=\"\'(im1-im2)/im3\'\" >> "+outfile+"_setup_q3.cl \n")
+    f.write("echo imcalc.pixtype=\"\'real\'\" >> "+outfile+"_setup_q3.cl \n")
+    f.write("cat "+outfile+"/raw.lis | awk '{print a,d$1b dd b ff b, e c$1,f}' a=imcalc dd=,"+dark+" ff=,"+flat+" b=[3] c=q3_ d=raw/ e="+outfile+"/ f=\"\'(im1-im2)/im3\'\" >> "+outfile+"_setup_q3.cl \n")
+    #### <--- PVD
+    f.write("cat "+outfile+"/raw.lis | awk '{print a,d$1b dd b ff b, e c$1,f}' a=imcalc dd=,"+dark+" ff=,"+flat+" b=[4] c=q4_ d=raw/ e="+outfile+"/ f=\"\'(im1-im2)/im3\'\" >> "+outfile+"_setup.cl \n")
+    f.write("cat "+outfile+"/raw.lis | awk '{print a b $1}' b=q1_ a="+outfile+"/ > "+outfile+"/raw_q1.lis \n")
+    f.write("cat "+outfile+"/raw.lis | awk '{print a b $1}' b=q2_ a="+outfile+"/ > "+outfile+"/raw_q2.lis \n")
+    f.write("cat "+outfile+"/raw.lis | awk '{print a b $1}' b=q3_ a="+outfile+"/ > "+outfile+"/raw_q3.lis \n")
+    f.write("cat "+outfile+"/raw.lis | awk '{print a b $1}' b=q4_ a="+outfile+"/ > "+outfile+"/raw_q4.lis \n")
+    #### PVD --->
+    f.write("echo wrapdimsum "+outfile+"/raw_q1.lis refimage="+refimage+"_q1 output="+outfile+"/"+outfile+" bpmask="+dbadpix+"bp_1.pl firstpass+ findshifts+ genweight+ firstcombine+ maskpass+ maskcomb+ nmean=8 nskymin=3 > "+outfile+"_reduce.cl \n")
+    f.write("echo !mv "+outfile+"/*_fp* reduced/q1/ >> "+outfile+"_reduce.cl \n")
+    f.write("echo !mv "+outfile+"/*_mp* reduced/q1/ >> "+outfile+"_reduce.cl \n")
+    f.write("echo !mv shift.lis reduced/q1/"+outfile+".shift.lis >> "+outfile+"_reduce.cl \n")
+    f.write("echo !mv shift.lis.weights reduced/q1/"+outfile+".shift.lis.weights >> "+outfile+"_reduce.cl \n")
+    f.write("echo wrapdimsum "+outfile+"/raw_q2.lis refimage="+refimage+"_q2 output="+outfile+"/"+outfile+" bpmask="+dbadpix+"bp_2.pl firstpass+ findshifts+ genweight+ firstcombine+ maskpass+ maskcomb+ nmean=8 nskymin=3 >> "+outfile+"_reduce.cl \n")
+    f.write("echo !mv "+outfile+"/*_fp* reduced/q2/ >> "+outfile+"_reduce.cl \n")
+    f.write("echo !mv "+outfile+"/*_mp* reduced/q2/ >> "+outfile+"_reduce.cl \n")
+    f.write("echo !mv shift.lis reduced/q2/"+outfile+".shift.lis >> "+outfile+"_reduce.cl \n")
+    f.write("echo !mv shift.lis.weights reduced/q2/"+outfile+".shift.lis.weights >> "+outfile+"_reduce.cl \n")
+    f.write("echo wrapdimsum "+outfile+"/raw_q3.lis refimage="+refimage+"_q3 output="+outfile+"/"+outfile+" bpmask="+dbadpix+"bp_3.pl firstpass+ findshifts+ genweight+ firstcombine+ maskpass+ maskcomb+ nmean=8 nskymin=3 >> "+outfile+"_reduce.cl \n")
+    f.write("echo !mv "+outfile+"/*_fp* reduced/q3/ >> "+outfile+"_reduce.cl \n")
+    f.write("echo !mv "+outfile+"/*_mp* reduced/q3/ >> "+outfile+"_reduce.cl \n")
+    f.write("echo !mv shift.lis reduced/q3/"+outfile+".shift.lis >> "+outfile+"_reduce.cl \n")
+    f.write("echo !mv shift.lis.weights reduced/q3/"+outfile+".shift.lis.weights >> "+outfile+"_reduce.cl \n")
+    f.write("echo wrapdimsum "+outfile+"/raw_q3.lis refimage="+refimage+"_q3 output="+outfile+"/"+outfile+" bpmask="+dbadpix+"bp_3.pl firstpass+ findshifts+ genweight+ firstcombine+ maskpass+ maskcomb+ nmean=8 nskymin=3 > "+outfile+"_reduce_q3.cl \n")
+    f.write("echo !mv "+outfile+"/*_fp* reduced/q3/ >> "+outfile+"_reduce_q3.cl \n")
+    f.write("echo !mv "+outfile+"/*_mp* reduced/q3/ >> "+outfile+"_reduce_q3.cl \n")
+    f.write("echo !mv shift.lis reduced/q3/"+outfile+".shift.lis >> "+outfile+"_reduce_q3.cl \n")
+    f.write("echo !mv shift.lis.weights reduced/q3/"+outfile+".shift.lis.weights >> "+outfile+"_reduce_q3.cl \n")
+    f.write("echo wrapdimsum "+outfile+"/raw_q4.lis refimage="+refimage+"_q4 output="+outfile+"/"+outfile+" bpmask="+dbadpix+"bp_4.pl firstpass+ findshifts+ genweight+ firstcombine+ maskpass+ maskcomb+ nmean=8 nskymin=3 >> "+outfile+"_reduce.cl \n")
+    f.write("echo !mv "+outfile+"/*_fp* reduced/q4/ >> "+outfile+"_reduce.cl \n")
+    f.write("echo !mv "+outfile+"/*_mp* reduced/q4/ >> "+outfile+"_reduce.cl \n")
+    f.write("echo !mv shift.lis reduced/q4/"+outfile+".shift.lis >> "+outfile+"_reduce.cl \n")
+    f.write("echo !mv shift.lis.weights reduced/q4/"+outfile+".shift.lis.weights >> "+outfile+"_reduce.cl \n")
+    #### <--- PVD
+    f.close() 
+#    os.system('source ../short ; source '+outfile+'.prep ; rm '+outfile+'.prep')
+    os.system('source '+outfile+'.prep ; rm '+outfile+'.prep')
+    f=open(outfile+'.setup_q3.idl','w')
+    f.write('readcol, "'+outfile+'/raw_q3.lis", fname, f="a"  \n for i=0,n_elements(fnames)-1 do writefits, fname[i]+".fits", (readfits(fname[i]+".fits",exten=3,hdr)-readfits("./calib/badpix/bp_q3.fits.gz"))/readfits("'+flat+'",exten=3), hdr')
+    f.close() 
+
+# find first field within distance_lim of ra,dec
+def resolvefield(ra,dec,fl):
+  a1 = todeg(ra)*15.
+  d1 = todeg(dec)
+  # loop fields
+  for name,ra2,dec2 in zip(fl.col('name'),fl.col('ra'),fl.col('dec')):
+    a2 = todeg(ra2)*15.
+    d2 = todeg(dec2)
+    dist = sqrt((d1-d2)**2 + ((a1-a2)*cos(d1*pi/180))**2)
+    if dist < distance_lim:
+      print 'resolved field ',a1,d1, ' = ', name, ' (distance ',dist, 'deg)' 
+      return name  
+  # we found no matching field
+  return 'UNKNOWN'
+  
+  
+# ------------------------------------------------- script starts here
+
+if len(sys.argv) < 2:
+  print 'usage: $ setup.py [path_to_raw_data/night]'
+  print 'e.g.: $ setup.py /Volumes/NEWFIRM1/20080325'
+  sys.exit()
+
+if not os.access('calib',os.F_OK):
+  os.mkdir('calib')
+  os.mkdir('calib/dark/')
+  os.mkdir('calib/flat/')
+  os.mkdir('calib/badpix/')
+  print 'note: calibration files in the following directories are required: '
+  print './calib ./calib/dark ./calib/flat ./calib/badpix'
+  
+dsrc = sys.argv[1]
+# assume night dir the deepest subdir in the provided path
+for dir in dsrc.split('/'):
+  if len(dir) > 0: dnight = dir
+
+if not os.access(dnight,os.F_OK):
+  os.mkdir(dnight)
+
+# change to the night dir
+os.chdir(dnight)
+
+# in the night directory: link the raw and calib directory
+if os.access(dsrc,os.F_OK):
+   if os.access(draw,os.F_OK):
+     os.system('rm raw')
+   os.system('ln -s '+dsrc+' '+draw)
+   if verbose: print('linking '+dsrc+' to '+draw)
+
+if not os.access('calib',os.F_OK):
+   os.system('ln -s ../calib')
+
+#### PVD --->
+if not os.access('reduced',os.F_OK):
+   os.mkdir('reduced/')
+   os.mkdir('reduced/q1/')
+   os.mkdir('reduced/q2/')
+   os.mkdir('reduced/q3/')
+   os.mkdir('reduced/q4/')
+#### <--- PVD
+ 
+# get summary of vital keywords 
+# note: wcstools need to be installed
+if verbose: print('getting header keywords of all fits files: this may take a minute...')
+hkey="FILENAME OBSTYPE TELRA TELDEC OBJECT EXPCOADD NCOADD EXPTIME  NOCNO NOCTOT TIME-OBS FILTER"
+o('echo "# '+hkey+' " | sed s/-//g > '+log)
+o('gethead -bf '+hkey+' raw/raw*fits* | sed s/\.fits// >> '+log) 
+
+# night log
+nl = cat(log)
+nl_frame = nl.col('filename') 
+nl_obj = nl.col('object') 
+nl_ditnr = nl.col('nocno') 
+nl_filt = nl.col('filter') 
+nl_ncoadd = nl.col('ncoadd') 
+nl_expcoadd = nl.col('expcoadd') 
+
+# this is wrong: use crval1,2
+nl_ra = nl.col('telra') 
+nl_dec = nl.col('teldec') 
+
+#field centers
+fl = cat('../'+fields)
+
+print 'extracting skysub sequences'
+dit0=999
+for frame,obj,dit,vfilt,ra,dec,ncoadd,expcoadd in zip(nl_frame,nl_obj,nl_ditnr,nl_filt,nl_ra,nl_dec,nl_ncoadd,nl_expcoadd):
+  #for fname,obj,dit in nl.col(['filename','object','nocno']):
+  if obj == 'DitherStare_Field':
+    # if dither follow number drops: signals a new sequence
+    if dit < dit0:      
+      # this is not the first sequence, so close the previous sequence first     
+      if dit0 < 999: 
+        f.close()       
+        #### PVD --->
+        write_prepscript(outfile,refimage,vfilt0,ncoadd0,expcoadd0) # write xdimsum setup script
+        #### <--- PVD
+      
+      # start new sequence
+      print '\nfound new dither sequence: filter='+vfilt
+      field =  resolvefield(ra,dec,fl)
+      outfile = field+'_'+vfilt
+      #### PVD --->
+      refimage = dref+field+'_ref'
+      #### <--- PVD
+
+      # make unique filenames a la iraf if already exists
+      while os.access(outfile,os.F_OK):
+         tmpout = outfile.split('.')
+         if len(tmpout) == 1:  # this is the second FIELD_FILTER -> so make FIELD_FILTER.1
+           outfile=outfile+'.1'
+         else: outfile=tmpout[0]+'.'+str(int(tmpout[1])+1) # make FIELD_FILTER.[N] -> FIELD_FILTER.[N+1]
+      else: os.mkdir(outfile)
+
+      if not os.access(outfile,os.F_OK):
+        os.mkdir(outfile)      
+      f=open(outfile+'/raw.lis','w')
+  
+    # write frame to current sequence
+    f.write(frame+'\n')
+    # properties of current sequence
+    dit0=dit
+    vfilt0=vfilt
+    ncoadd0=ncoadd
+    expcoadd0=expcoadd
+
+# close final dither file
+f.close() # closing previous file        
+##### ---> PVD
+write_prepscript(outfile,refimage,vfilt0,ncoadd0,expcoadd0) # write xdimsum setup script
+##### <--- PVD
+
+sys.exit()
